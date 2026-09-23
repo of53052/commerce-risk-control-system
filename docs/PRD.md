@@ -153,7 +153,7 @@
 
 | 存储 | 承担 | 不承担 |
 | --- | --- | --- |
-| Redis | ① 特征滑动窗口（ZSET 按时间戳成员）② 事件幂等（`event_id → 首次决策结果`，TTL 24h）③ SSE 广播通道 ④ 实时计数器 | 不存最终事实，不做审计 |
+| Redis | ① 特征滑动窗口（ZSET 事件条带）② 事件幂等（`event_id → 首次决策结果`，TTL 24h）③ SSE 广播通道（Pub/Sub）④ 实时计数器 ⑤ 名单缓存（TTL 60s，写后主动失效）⑥ 模型热切换信号 | 不存最终事实，不做审计 |
 | MySQL | 事件 / 特征快照 / 决策 / 命中明细 / 案件 / 处置 / 规则与版本 / 名单 / 模型版本 / 审计链 / 监控预聚合 | 不做毫秒级热计数 |
 
 原则：**Redis 可丢，MySQL 不可丢**。Redis 重启后窗口数据从 `rc_event` 回溯重建（提供 `scripts/rebuild_windows.py`）。
@@ -216,7 +216,13 @@
 
 ### 7.1 窗口档位
 
-统一三档滑动窗口：**1 小时 / 24 小时 / 7 天**（落 `sys_config` 可调）。实现方式：Redis ZSET，score 为事件时间戳毫秒，member 为 `event_id`，按 `ZCOUNT key min max` 统计频次；辅助计数器 HASH 累计金额。
+统一三档滑动窗口：**1 小时 / 24 小时 / 7 天**（落 `sys_config` 可调）。实现方式：Redis ZSET「事件条带」，键模式 `rc:evt:{entity}:{id}:{eventType}:{window}`，score = 事件时间戳毫秒，member = `{ts_ms}|{event_id}|{amount}`，TTL = 窗口时长 + 10 分钟。
+
+- 计数：`ZCOUNT key <min> <max>`；金额：`ZRANGEBYSCORE` 取出成员后解析 `amount` 求和。
+- member 内含 `event_id`，**重复投递天然不重复计数**（ZSET 集合语义自带去重），无需额外去重结构。
+- 不另设「金额计数器 HASH」：计数与求和共用同一结构，避免两个结构在并发下漂移；取舍详见 `docs/ARCHITECTURE.md` §6.2。
+
+**快照键命名约定**：`{feature_key}_{window}`（如 `device_account_cnt_24h`）；无窗口特征不加后缀（如 `account_age_days`、`subject_blacklist`）。规则表达式与模型特征向量一律使用快照键名。
 
 ### 7.2 特征清单
 
@@ -652,7 +658,7 @@ device_account_cnt_24h >= 3 and user_coupon_cnt_1h > 5 and account_age_days < 7
 | `rc_feature_snapshot` | id, event_id, features(json), window_profile, calc_cost_ms, feature_version, created_at |
 | `rc_decision` | id, decision_id, event_id(uk), rule_score, model_score, risk_score, risk_level, action, action_hint, decided_by, fusion_alpha, model_version, case_no, hit_count, latency_ms, from_cache, created_at |
 | `rc_decision_hit` | id, decision_id, rule_code, rule_name, rule_category, score, reason, evidence(json) |
-| `rc_model_contribution` | id, decision_id, feature_name, feature_value, contribution, direction, rank |
+| `rc_model_contribution` | id, decision_id, feature_name, feature_value, contribution, direction, rank_no（`rank` 是 MySQL 8 保留字，故改名） |
 | `rc_rule` | id, code(uk), name, scene, category, condition(json), condition_text, score, action_hint, priority, enabled, version, description, created_by, updated_by, created_at, updated_at |
 | `rc_rule_version` | id, rule_code, version, condition(json), condition_text, score, action_hint, enabled, change_type, changed_by, changed_at |
 | `rc_list_entry` | id, list_type, dimension, value, priority, reason, source, expire_at, status, created_by, created_at, updated_at（`list_type+dimension+value` 唯一） |
@@ -677,6 +683,7 @@ commerce-risk-control-system/
 │  ├─ gen_dataset.py              # 数据集与场景生成
 │  ├─ train_model.py              # 离线训练 → model.json
 │  ├─ rebuild_windows.py          # Redis 窗口重建
+│  ├─ replay_write_failures.py    # 落库失败补偿重放
 │  └─ verify_p0.ps1               # P0 验收脚本
 ├─ backend/
 │  ├─ requirements.txt  alembic.ini  alembic/versions/

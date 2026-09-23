@@ -42,7 +42,7 @@
 | 单图节点上限 | ≤ 20 个，超出即拆分视角 |
 | 边标签 | ≤ 12 个汉字，必要时 `<br/>` 换行，避免压线 |
 | 图例 | 统一由本节色板表承担，**图内不重复绘制图例子图**（避免挤占单图节点预算） |
-| 节点统计 | 不含子图标题；§3=16、§4=19、§2.1=13、§6.3=13，均 ≤ 20 |
+| 节点统计 | 不含子图标题；§3=16、§4=19、§2.1=13、§6.3=15，均 ≤ 20 |
 | 中文 | 节点标签一律中文（技术标识除外），字体交给渲染器 |
 
 ---
@@ -193,8 +193,8 @@ flowchart LR
 | 前端 dev server | Vite | 5173 | `/api` 代理到 8000 |
 | 后端服务 | Uvicorn + FastAPI | 8000 | REST + SSE；单 worker（见 ADR-13） |
 | 单端口演示 | FastAPI 静态托管 `frontend/dist` | 8000 | 答辩模式，只需一个地址 |
-| MySQL | 本地 | 3306 | 库 `risk_control` |
-| Redis | 本地 | 6379 | 逻辑库 0 |
+| MySQL | 本地实例 | 3306 | 库 `risk_control` |
+| Redis | 本地实例 | 6379 | 逻辑库 0 |
 
 ---
 
@@ -472,6 +472,7 @@ erDiagram
   rc_case {
     bigint id PK
     varchar case_no UK
+    varchar subject_type
     varchar subject_value
     varchar scene
     varchar status
@@ -524,6 +525,27 @@ erDiagram
     datetime expire_at
   }
 
+  rc_audit_log {
+    bigint id PK
+    varchar actor_id
+    varchar actor_name
+    varchar role
+    varchar action
+    varchar target_type
+    varchar target_id
+    varchar prev_hash
+    varchar hash
+    datetime created_at
+  }
+  rc_metric_daily {
+    bigint id PK
+    date stat_date
+    varchar scene
+    int event_cnt
+    int reject_cnt
+    decimal saved_amount
+  }
+
   rc_event ||--|| rc_feature_snapshot : "1:1 快照"
   rc_event ||--|| rc_decision : "1:1 首判"
   rc_decision ||--o{ rc_decision_hit : "1:N 命中规则"
@@ -536,7 +558,7 @@ erDiagram
   rc_list_entry ||--o{ rc_case_action_item : "处置写入名单"
 ```
 
-图中仅列关键字段（完整字段、类型与索引见 `docs/PRD.md` 附录 A）；`biz_*` 与 `sys_*` 为支撑域，不在此图。
+图中仅列关键字段（完整字段、类型与索引见 `docs/PRD.md` 附录 A）。其中 `rc_audit_log` 是链式只增表（`prev_hash → hash`），不与业务表建外键；`rc_metric_daily` 为派生聚合表，同样无外键关系；`biz_*` 与 `sys_*` 为支撑域，不在此图。
 
 ### 6.4 读写路径与索引策略
 
@@ -700,6 +722,8 @@ elif risk_score >= 60:
 else:                           action = Pass
 ```
 
+融合模式由 `sys_config.fusion_mode` 决定（`additive` 默认 / `max` / `weighted`），上式是 `additive` 形态。
+
 三个分与 `decided_by` 全部落库——审核员看到的"系统判定摘要"就是这几个值；被问"为什么是 87 分"时可直接展开：哪几条规则贡献了多少、模型贡献了多少。
 
 ### 7.5 名单匹配
@@ -738,7 +762,7 @@ UPDATE rc_case
 
 ```
 prev = (SELECT hash FROM rc_audit_log ORDER BY id DESC LIMIT 1) 或 GENESIS
-payload = canonical_json({actor, role, action, target_type, target_id, before, after, reason, created_at})
+payload = canonical_json({actor_id, actor_name, role, action, target_type, target_id, before_json, after_json, reason, created_at})  # 字段名与 rc_audit_log 表一致
 hash = sha256(prev + payload)
 ```
 
