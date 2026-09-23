@@ -23,7 +23,7 @@
 | 可审计 | 处置与策略变更不可篡改 | 审计日志只增不改 + SHA-256 前向哈希链 + 独立校验接口 |
 | 可复现 | 演示与答辩需可重复 | 固定随机种子；模型是**文件**而非服务；场景脚本可重放 |
 | 可维护 | 单人维护、长期演进 | 单向依赖分层；特征/规则/配置集中注册；配置一律入 `sys_config` |
-| 环境 | 本地单机（FlyEnv 托管 MySQL/Redis） | 单实例部署模型；不引入 MQ / 容器编排 |
+| 环境 | 本地单机（本地 托管 MySQL/Redis） | 单实例部署模型；不引入 MQ / 容器编排 |
 
 **明确的架构反目标**：不追高可用、不做水平扩展、不做多租户、不做不停机热升级。为了让 P0 尽快可验证，宁可单实例简单直接。
 
@@ -41,7 +41,8 @@
 | 风险/阻断语义 | 填充 `#fff2f0` / 描边 `#ff4d4f` / 文字 `#cf1322` |
 | 单图节点上限 | ≤ 20 个，超出即拆分视角 |
 | 边标签 | ≤ 12 个汉字，必要时 `<br/>` 换行，避免压线 |
-| 图例 | 节点 ≥ 10 个的架构图在底部附「图例」子图 |
+| 图例 | 统一由本节色板表承担，**图内不重复绘制图例子图**（避免挤占单图节点预算） |
+| 节点统计 | 不含子图标题；§3=16、§4=19、§2.1=13、§6.3=13，均 ≤ 20 |
 | 中文 | 节点标签一律中文（技术标识除外），字体交给渲染器 |
 
 ---
@@ -109,7 +110,7 @@ flowchart TB
     RC["实时风控服务<br/>决策 + 案件 + 策略 + 大盘"]
   end
 
-  subgraph infra["本地基础设施（FlyEnv 托管）"]
+  subgraph infra["本地基础设施（本地 托管）"]
     DB[("MySQL 8.2<br/>risk_control")]
     RDS[("Redis 8.8")]
   end
@@ -175,21 +176,14 @@ flowchart LR
   REB --> RDS
   VER --> API
 
-  subgraph legend["图例"]
-    LEG_FE["前端 SPA"]
-    LEG_BE["后端服务"]
-    LEG_JOB["离线脚本"]
-    LEG_STORE[("数据存储")]
-  end
-
   classDef fe fill:#e6f4ff,stroke:#1677ff,color:#0958d9
   classDef be fill:#f9f0ff,stroke:#722ed1,color:#531dab
   classDef job fill:#f6ffed,stroke:#52c41a,color:#237804
   classDef store fill:#fffbe6,stroke:#faad14,color:#ad6800
-  class P0,P1,P2,P3,P4,P5,LEG_FE fe
-  class API,SVC,REPO,BG,LEG_BE be
-  class GEN,TRAIN,REB,VER,LEG_JOB job
-  class DB,RDS,LEG_STORE store
+  class P0,P1,P2,P3,P4,P5 fe
+  class API,SVC,REPO,BG be
+  class GEN,TRAIN,REB,VER job
+  class DB,RDS store
 ```
 
 进程与端口：
@@ -199,8 +193,8 @@ flowchart LR
 | 前端 dev server | Vite | 5173 | `/api` 代理到 8000 |
 | 后端服务 | Uvicorn + FastAPI | 8000 | REST + SSE；单 worker（见 ADR-13） |
 | 单端口演示 | FastAPI 静态托管 `frontend/dist` | 8000 | 答辩模式，只需一个地址 |
-| MySQL | FlyEnv | 3306 | 库 `risk_control` |
-| Redis | FlyEnv | 6379 | 逻辑库 0 |
+| MySQL | 本地 | 3306 | 库 `risk_control` |
+| Redis | 本地 | 6379 | 逻辑库 0 |
 
 ---
 
@@ -251,21 +245,14 @@ flowchart TD
   S8 --> S9
   S6 --> S10
 
-  subgraph legend2["图例"]
-    LEG_API["接口层"]
-    LEG_SVC["领域服务"]
-    LEG_DOM["表达式 / 仿真 / 种子"]
-    LEG_INF["基础设施与模型"]
-  end
-
   classDef api fill:#e6f4ff,stroke:#1677ff,color:#0958d9
   classDef svc fill:#f9f0ff,stroke:#722ed1,color:#531dab
   classDef dom fill:#f6ffed,stroke:#52c41a,color:#237804
   classDef inf fill:#fffbe6,stroke:#faad14,color:#ad6800
-  class A1,A2,A3,A4,LEG_API api
-  class S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,LEG_SVC svc
-  class E1,E2,E3,LEG_DOM dom
-  class I1,I2,LEG_INF inf
+  class A1,A2,A3,A4 api
+  class S1,S2,S3,S4,S5,S6,S7,S8,S9,S10 svc
+  class E1,E2,E3 dom
+  class I1,I2 inf
 ```
 
 **依赖方向是单向的**：`api → services → (expression | models) → core`。禁止反向引用（服务层不得 import router），禁止跨服务直接读对方的表（如需跨域数据，走对方的 service 方法）。这条规则是单人维护代码库不腐化的最低成本保障。
@@ -885,7 +872,7 @@ flowchart LR
 | 演示模式 | `npm run build` 后由 FastAPI 挂载 `frontend/dist`，单端口 8000 演示 |
 | 数据迁移 | Alembic 版本化；`init_db.ps1` 幂等（重复执行不报错） |
 | 回滚 | 代码回滚用 git；数据回滚＝重建 `risk_control` 库（独立库，不与其他库耦合），故不做向下迁移脚本 |
-| 依赖前提 | FlyEnv 启动 MySQL 8.2 与 Redis 8.8；Python 3.12 项目内 `.venv` |
+| 依赖前提 | 本地 启动 MySQL 8.2 与 Redis 8.8；Python 3.12 项目内 `.venv` |
 
 ---
 
