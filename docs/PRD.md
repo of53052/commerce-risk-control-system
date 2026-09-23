@@ -433,6 +433,12 @@ device_account_cnt_24h >= 3 and user_coupon_cnt_1h > 5 and account_age_days < 7
 - 每条记录含 `prev_hash`（上一条的 `hash`）与 `hash = sha256(prev_hash + 规范化业务字段串)`。
 - 提供 `GET /api/v1/audit/verify`：全链重算并返回 `{total, valid, first_broken_id}`；"审计与模型"页提供一键校验按钮——可用于现场演示"手工改一条记录 → 校验立即报链断裂"。
 
+**实现口径（P0 落地时确认）**：
+
+- 触发器 `trg_rc_audit_log_no_update` / `trg_rc_audit_log_no_delete` 已随迁移创建，命中即 `SIGNAL SQLSTATE '45000'`（错误码 1644），对所有数据库账号一视同仁。
+- 因此"改一条记录演示链断裂"的正确做法是**先 `DROP TRIGGER` → 再 `UPDATE` → 校验接口报断裂 → 重建触发器**。这不是缺陷，而是可展示的纵深防御：第一层挡住直接篡改，绕过第一层后第二层仍能发现。
+- 因本项目以 `root` 连接（本地单机演示定位），"应用账号只授 INSERT/SELECT"这一层**当前无法真实生效**，属于已知限制；替换为独立受限账号是 P2 之后的部署优化项，不影响哈希链与触发器两层防护。
+
 ### 10.3 模型治理
 
 "审计与模型"页展示模型版本列表（版本号、AUC/KS、训练样本数、训练时间、启用状态），支持切换启用版本；每次切换入审计。重训流程：`scripts/gen_dataset.py` → `scripts/train_model.py` → 新版本入 `rc_model_version`。
@@ -543,7 +549,22 @@ device_account_cnt_24h >= 3 and user_coupon_cnt_1h > 5 and account_age_days < 7
 | 审计 | `rc_audit_log` | P0 |
 | 监控 | `rc_metric_daily` | P2 |
 
-索引要点：`rc_event(event_id)` 唯一、`rc_event(user_id, occurred_at)`、`rc_event(device_id, occurred_at)`、`rc_event(ip, occurred_at)`；`rc_decision(event_id)` 唯一；`rc_case(subject_value, scene, status)`；`rc_list_entry(list_type, dimension, value)` 唯一；`rc_audit_log` 主键自增即链序。
+索引要点：`rc_event(event_id)` 唯一、`rc_event(user_id, occurred_at)`、`rc_event(device_id, occurred_at)`、`rc_event(ip, occurred_at)`；`rc_decision(event_id)` 唯一；`rc_case(subject_value, scene, status)`；`rc_list_entry(list_type, dimension, value)` 唯一；`sys_api_key(api_key_hash)` 唯一；`rc_audit_log` 主键自增即链序。
+
+### 13.1 配置键注册表（`sys_config`）
+
+P0 落地的 8 个配置键。**代码侧权威定义在 `backend/app/services/config_service.py` 的 `CONFIG_SPECS`**，种子由它自动生成；表里缺键时业务代码回退注册表默认值，因此清空配置表不会让系统不可用。
+
+| 键 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `risk_threshold_review` | int | `60` | 综合分达到该值判中风险，动作 `Review` 并建案 |
+| `risk_threshold_reject` | int | `80` | 综合分达到该值判高风险，动作 `Reject` 并建案 |
+| `fusion_alpha` | float | `0.3` | 融合权重 α |
+| `fusion_mode` | str | `additive` | 融合模式：`additive` / `max` / `weighted` |
+| `list_conflict_policy` | str | `black_first` | 名单黑白同时命中的优先级策略 |
+| `rule_strict_mode` | bool | `false` | 规则求值严格模式（字段缺失是否判求值失败） |
+| `case_merge_window_minutes` | int | `30` | 案件合案窗口（分钟） |
+| `feature_windows` | json | `{"1h":3600,"24h":86400,"7d":604800}` | 特征滑动窗口档位：档位名 → 秒数 |
 
 ---
 
@@ -686,21 +707,23 @@ commerce-risk-control-system/
 │  ├─ replay_write_failures.py    # 落库失败补偿重放
 │  └─ verify_p0.ps1               # P0 验收脚本
 ├─ backend/
-│  ├─ requirements.txt  alembic.ini  alembic/versions/
+│  ├─ requirements.txt  alembic.ini  alembic/{env.py, versions/}
+│  │                              # 注意：alembic.ini 必须保持纯 ASCII（GBK 解码坑）
 │  ├─ app/
 │  │  ├─ main.py
 │  │  ├─ core/        # settings / security(JWT+APIKey) / logging / deps
-│  │  ├─ db/          # session / base
+│  │  ├─ db/          # session / base / bootstrap(建库)
 │  │  ├─ models/      # 按域拆分
 │  │  ├─ schemas/     # 事件 / 决策 / 案件 / 规则 / 名单 / 审计
 │  │  ├─ api/         # gateway, decisions, cases, rules, lists,
 │  │  │               # dashboard, simulation, audit, auth, models, configs
-│  │  ├─ services/    # event_gateway, feature_engine, rule_engine,
-│  │  │               # model_engine, fusion, list_service, case_service,
-│  │  │               # disposal_service, audit_service, metrics_service
+│  │  ├─ services/    # config_service, event_gateway, feature_engine,
+│  │  │               # rule_engine, model_engine, fusion, list_service,
+│  │  │               # case_service, disposal_service, audit_service,
+│  │  │               # metrics_service
 │  │  ├─ expression/  # lexer / parser / ast / evaluator
 │  │  ├─ simulator/   # 模拟业务端 + 事件流回放
-│  │  └─ seeds/       # 账号 / 规则 / 名单 / API Key / 场景脚本
+│  │  └─ seeds/       # configs / accounts / api_keys / rules / lists
 │  ├─ models_artifacts/model.json
 │  └─ tests/          # 窗口 / 表达式 / 仲裁 / 名单优先级 / 集成
 └─ frontend/

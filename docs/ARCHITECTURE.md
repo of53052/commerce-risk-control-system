@@ -768,7 +768,9 @@ hash = sha256(prev + payload)
 
 - **串行化**：审计写入由单消费者协程处理（`asyncio.Queue`），单实例下天然保序；多实例扩展需换 DB 行锁或分布式锁（见 §16）。
 - **规范化 JSON**：键排序、时间统一 ISO8601 UTC、空值统一 `null`——否则同样的业务内容会算出不同哈希，链会"假断裂"。
-- **不可篡改**：应用账号对 `rc_audit_log` 只授 `INSERT`/`SELECT`；另加 `BEFORE UPDATE` / `BEFORE DELETE` 触发器 `SIGNAL SQLSTATE '45000'` 兜底。
+- **不可篡改**：应用账号对 `rc_audit_log` 只授 `INSERT`/`SELECT`；另加 `BEFORE UPDATE` / `BEFORE DELETE` 触发器 `SIGNAL SQLSTATE '45000'` 兜底（已随 P0 迁移创建）。
+- **演示方式**：触发器对所有账号生效且 MySQL 不支持禁用触发器，故演示"链断裂检测"需先 `DROP TRIGGER` → 改一行 → 调校验接口 → 重建触发器。这反而更能说明纵深防御：第一层挡住直接篡改，绕过第一层后第二层仍然发现。
+- **已知限制**：本项目以 `root` 连接，`INSERT/SELECT` 授权这一层当前不生效（详见 docs/PRD.md §10.2 实现口径）。哈希链与触发器两层不受影响。
 - **校验**：`GET /api/v1/audit/verify` 从 `GENESIS` 顺序重算，遇第一条不匹配即返回 `first_broken_id`。演示脚本会用有权限的账号故意 `UPDATE` 一条记录再调校验接口，展示断裂检测。
 
 ### 7.8 大盘与 SSE
@@ -836,6 +838,8 @@ frontend/src/
 | 敏感信息 | API Key 只存哈希；日志脱敏（手机号中间四位、token 截断）；`.env` 不入库 |
 | 传输 | 本地 HTTP；对外暴露必须置于 HTTPS 之后（部署前提，非本期范围） |
 | SSE | token 走 Authorization 头（fetch 流式实现），不进 URL；同源校验 |
+
+**哈希算法分族（P0 落地确认）**：口令用 bcrypt（低熵、需抗离线爆破）；API Key 用 SHA-256（32 字节随机、高熵不可爆破），且摘要确定，可建唯一索引做等值查找。给 API Key 上 bcrypt 会给每次事件接入加约 250ms，直接违背 §12 的 P95 指标。实现见 `backend/app/core/security.py`。
 
 ---
 
@@ -1004,3 +1008,40 @@ flowchart TB
 | `rc_cnt:*` | Redis | 大盘计数桶 |
 | `rc:sse:events` | Redis Pub/Sub | 广播给大盘滚屏 |
 | `rc_audit_log` | MySQL | 系统动作（模型切换、名单变更）；人工处置另行写入 |
+
+---
+
+## 19. P0 落地记录（实现与设计的偏差）
+
+本节记录 P0 实际编码时对本文档与 PRD 的**有意偏离**及其原因，避免后续维护者
+把"实现与文档不一致"当成 bug 去改回来。
+
+### 19.1 运行环境与工程化
+
+| 项 | 结论 | 原因 |
+| --- | --- | --- |
+| `alembic.ini` 全 ASCII | 强制约定 | Windows 上 Alembic 用 `configparser` 读 ini，Python 3.12 的 `configparser` 走 `encoding="locale"`（zh-CN 下为 cp936），文件里任何中文注释都会让所有 alembic 命令 `UnicodeDecodeError`。故 ini 保持纯 ASCII，中文说明写在 `alembic/env.py` 与本文件。 |
+| 连接串不写 ini | 强制约定 | 由 `alembic/env.py` 从 `app.core.config.settings` 读取（`backend/.env`，已 gitignore），保证"应用连哪个库、迁移就改哪个库"，口令不入库。 |
+| 模型注释中的引号 | 用「」不用 `"` | 已在 `decision.py` / `sys.py` 各修复一处真实语法错误：`comment="…"如"…""` 会让 `.py` 直接 `SyntaxError`。这类错误只在首次真正 import 该包时暴露，`compileall` 能提前拦住。 |
+| 建库逻辑 | `app/db/bootstrap.py` | `CREATE DATABASE` 必须连实例层级，而 SQLAlchemy engine 强制带库名；直连 PyMySQL 更直接，同时供测试夹具复用。库名做 `isalnum` 白名单校验防注入。 |
+
+### 19.2 安全
+
+| 变更 | 决策 |
+| --- | --- |
+| API Key 哈希 | bcrypt → **SHA-256**（列由 `VARCHAR(128)` 收窄为 `VARCHAR(64)` 并加唯一索引）。理由：高熵随机串无需慢哈希，而 bcrypt 每次约 250ms 会加在**每一次事件接入**上，直接违背 §12 P95 指标；确定性摘要还允许按哈希等值查找。 |
+| 审计触发器 | 已随迁移创建，对所有账号生效（含 root）。演示"链断裂"需先 `DROP TRIGGER` → 篡改 → 校验 → 重建。 |
+| `INSERT/SELECT` 授权层 | **当前未生效**（以 root 连接），已知限制。纵深防御剩余两层（触发器、哈希链）均可用。 |
+
+### 19.3 配置
+
+`sys_config` 的 8 个键以 `app/services/config_service.py` 的 `CONFIG_SPECS` 为唯一权威定义，
+种子（`app/seeds/configs.py`）由注册表自动生成，避免"注册表与种子漂移"。
+读取侧带 10 秒进程内缓存，写侧 `invalidate_cache()` 保证"保存即生效"。
+
+### 19.4 已完成与未完成
+
+| 状态 | 内容 |
+| --- | --- |
+| ✅ 已完成 | 依赖安装与 `.venv`；建库/迁移/种子三段式初始化；18 张 P0 表 + 审计只增触发器；3 账号 / 8 配置 / API Key 种子；`/healthz`（MySQL 8.2 + Redis 8.8 均 ok）；`alembic check` 无漂移 |
+| ○ 未完成 | 表达式引擎、服务层（特征/规则/模型/融合）、事件网关 API、模拟业务端、数据集与训练脚本、测试与 `verify_p0.ps1`、`docs/P0-验收清单.md` |
