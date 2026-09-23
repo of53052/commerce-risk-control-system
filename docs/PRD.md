@@ -135,8 +135,8 @@
 | 前端（Vite dev server） | `http://127.0.0.1:5173` | 开发态，`/api` 反向代理到后端 8000 |
 | 后端（Uvicorn + FastAPI） | `http://127.0.0.1:8000` | 提供 REST + SSE |
 | 单端口演示模式 | `http://127.0.0.1:8000` | 前端 `build` 产物由 FastAPI 静态托管，供答辩演示 |
-| MySQL | `127.0.0.1:3306`，库 `risk_control` | 账号 `root` / `123456`（本地 托管） |
-| Redis | `127.0.0.1:6379` | 本地 托管 |
+| MySQL | `127.0.0.1:3306`，库 `risk_control` | 账号 `root` / `123456`（本地托管） |
+| Redis | `127.0.0.1:6379` | 本地托管 |
 
 一键启动脚本 `scripts/dev.ps1` 同时拉起后端与前端；数据库初始化 `scripts/init_db.ps1`（建库 → Alembic 迁移 → 种子数据）。
 
@@ -627,7 +627,7 @@ device_account_cnt_24h >= 3 and user_coupon_cnt_1h > 5 and account_age_days < 7
 
 | # | 风险 / 待确认 | 影响 | 应对 |
 | --- | --- | --- | --- |
-| 1 | 本地 托管的 MySQL / Redis 需保持运行 | 后端不可用 | `dev.ps1` 启动前做依赖健康检查并给出明确提示 |
+| 1 | 本地托管的 MySQL / Redis 需保持运行 | 后端不可用 | `dev.ps1` 启动前做依赖健康检查并给出明确提示 |
 | 2 | 模型指标基于合成数据，AUC 偏乐观 | 答辩质疑"模型太好看" | PRD 与页面均标注"合成数据集训练，指标仅供演示" |
 | 3 | UI 规范 `DESIGN.md` 由我生成，你后续会调整 | 页面返工 | 视觉规范与代码解耦（AntD token + 主题文件），改规范只改 token |
 | 4 | 决策响应与落库解耦可能造成短暂不一致 | 大盘短时抖动 | 落库失败重试 + 补偿日志；大盘以落库数据为准并标注延迟 |
@@ -663,7 +663,7 @@ device_account_cnt_24h >= 3 and user_coupon_cnt_1h > 5 and account_age_days < 7
 
 ```
 commerce-risk-control-system/
-├─ AGENTS.md                      # 协作规范（自 本地 引入）
+├─ AGENTS.md                      # 协作规范（自本地引入）
 ├─ README.md                      # 环境准备 / 启动 / 验收 / 演示
 ├─ 项目实战.md                    # 原始需求
 ├─ .gitignore  .env.example
