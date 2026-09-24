@@ -5,7 +5,7 @@ import LoginPage from "@/pages/Login";
 import { useAuthStore } from "@/store/auth";
 
 const DashboardPage = lazy(() => import("@/pages/Dashboard"));
-const WorkbenchPage = lazy(() => import("@/pages/Workbench"));
+const WorkbenchPage = lazy(() => import("@/pages/workbench"));
 const PolicyPage = lazy(() => import("@/pages/Policy"));
 const SimulationPage = lazy(() => import("@/pages/Simulation"));
 

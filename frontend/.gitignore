@@ -3,7 +3,10 @@
 /dist-ssr
 *.local
 .vite
-# tsc 增量缓存与误编译产物（vite.config.ts 只应保留 .ts 源）
+# `tsc -b` 的构建模式会在项目根落一个增量缓存文件。
+# 注意：vite.config.ts 的编译产物**不在这里** —— 它已在 tsconfig.node.json 里被
+# emitDeclarationOnly + outDir 重定向到 node_modules/.tmp/tsconfig-node。
+# 原因：Vite 解析配置时 `vite.config.js` 优先于 `vite.config.ts`，
+# 产物落在本目录会静默顶掉真配置（改 .ts 没反应）。故此处**不再忽略** vite.config.js，
+# 一旦它意外重现，git status 会立刻暴露。
 tsconfig.tsbuildinfo
-vite.config.d.ts
-vite.config.js

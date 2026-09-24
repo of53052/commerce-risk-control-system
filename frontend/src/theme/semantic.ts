@@ -26,3 +26,22 @@ export const LINK_COLORS = {
   model: "#7C3AED",   // 模型：AI 点缀紫（DESIGN.md §2.2）
   decision: "inherit" // 决策：由结果决定（Pass/Challenge/Review/Reject）
 } as const;
+
+/**
+ * 模型贡献的**方向**配色：正贡献推高风险、负贡献拉低风险。
+ *
+ * 这是"风险语义色"的一种用法，因此必须复用 `RISK_COLORS` 而不是另配一组红绿 ——
+ * 否则界面里会出现两种含义不同却看起来一样的红色，审核员无法判断
+ * "这个红是高风险等级，还是这一项在推高风险"（DESIGN.md §1.2：语义色唯一且稳定）。
+ *
+ * 同时导出底/字色，供条形图填充与数值文字共用，避免页面各取一半。
+ */
+export const RISK_DIRECTION = {
+  /** 推高综合分：与高风险同色。 */
+  positive: { color: RISK_COLORS.high.color, bg: RISK_COLORS.high.bg },
+  /** 拉低综合分：与低风险同色。 */
+  negative: { color: RISK_COLORS.low.color, bg: RISK_COLORS.low.bg },
+} as const;
+
+/** 窗口对比高亮底（"短窗集中"）：复用中风险底，表示"需要留意但未定性"。 */
+export const WINDOW_HIGHLIGHT_BG = RISK_COLORS.mid.bg;

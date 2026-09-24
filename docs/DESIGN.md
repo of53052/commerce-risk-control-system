@@ -238,8 +238,17 @@
 | 风险/动作语义色 | `frontend/src/theme/semantic.ts` 导出 `RISK_COLORS`、`ACTION_COLORS`，**全站引用，禁止硬编码** |
 | 图表色板 | `frontend/src/theme/charts.ts` 导出 `CHART_PALETTE` 并注册 ECharts 主题 |
 | 布局尺寸 | `frontend/src/theme/layout.ts` 常量（侧边栏宽度、三栏宽度、图谱高度） |
+| 卡片阴影 / 圆角 / 选中底 | `frontend/src/theme/tokens.ts` 导出 `SURFACES`。工作台三栏是自绘分栏容器而非 AntD Card，直接写 `boxShadow` 字符串会脱离规范（§5 要求带蓝相的 `rgba(15,23,42,*)` 且禁止叠加多层） |
 | 深色导航 / 登录 | `frontend/src/theme/brand.ts` 导出 `NAV_TOKENS` 与 `LOGIN_TOKENS`，仅这两个位置允许引用 |
 | 智能点缀 | `frontend/src/theme/ai.ts` 导出 `AI_TOKENS`，所有模型相关视觉这里统一管 |
+
+### 10.1 落地偏差与实现约定（P1-b 收官时补记）
+
+| 规范意图 | 代码实现 | 说明 |
+| --- | --- | --- |
+| §5 "表格默认 `size="middle"`" | 工作台左栏用**卡片式行**而非 `Table` | 左栏宽 `320px`，塞进 8 列表格后每列只剩 40px，只能靠省略号；卡片式行一屏能读到"案件号 / 主体 / 分数 / 命中数 / 状态 / 相对时间"全部关键字段。§5 的"表格"口径约束的是**证据区表格**（特征快照、命中规则），这两处仍是 `Table size="middle"` |
+| §8 "悬浮显示相对时间" | 列表与头部显示**相对时间**，`Descriptions` 显示绝对时间 | 列表的目的是"快速发现最近的"，绝对时间在那里没有比较价值；详情区需要精确到秒用于核对，故反过来。两者都由 `utils/datetime.ts` 统一格式化，`+8` 时区转换只在这一处做 |
+| §9 "证据链卡片用 `ai-600` 左色条标出模型关注点" | 已落地：模型贡献块 `ai-50` 底 + `3px` `ai-600` 左色条 + 标题同色（`EvidencePanel.tsx` 模型贡献段） | 左色条同时用于"短窗集中"高亮行，两者形状相同但底色不同（`ai-50` vs 警示底），不会混淆 |
 
 ---
 

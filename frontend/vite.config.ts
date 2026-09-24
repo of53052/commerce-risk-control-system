@@ -17,6 +17,13 @@ export default defineConfig({
         target: "http://127.0.0.1:8000",
         changeOrigin: true,
       },
+      // 健康检查在根路径（后端刻意不放进 /api/v1，见 app/main.py 与 src/api/health.ts）。
+      // 不代理它会命中 Vite 的 SPA fallback 返回 index.html + 200：
+      // axios 拿到的是 HTML 而非 HealthZ，登录页既不报错也不显示状态，比 404 更难查。
+      "/healthz": {
+        target: "http://127.0.0.1:8000",
+        changeOrigin: true,
+      },
     },
   },
 

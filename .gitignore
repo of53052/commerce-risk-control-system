@@ -32,7 +32,11 @@ backend/models_artifacts/*.tmp
 
 # ---- 临时诊断与评审脚本（下划线开头 = 一次性产物，不入库）----
 scripts/_*.py
+scripts/_*.mjs
+scripts/_*.ps1
 scripts/_*.md
 scripts/_*.txt
 scripts/_*.log
 scripts/_shots/
+frontend/public/_*.html
+backend/_*.py
