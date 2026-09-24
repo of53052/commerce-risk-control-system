@@ -35,3 +35,4 @@ scripts/_*.py
 scripts/_*.md
 scripts/_*.txt
 scripts/_*.log
+scripts/_shots/

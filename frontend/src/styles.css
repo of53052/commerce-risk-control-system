@@ -1,0 +1,50 @@
+/** DESIGN.md 全局基础样式（排版、背景、代码字体、focus、reduced-motion）。 */
+:root {
+  --brand: #1e5eff;
+  --brand-weak: #2f6dff;
+  --brand-deep: #1848d1;
+  --ai: #7c3aed;
+  --bg: #f6f7fb;
+  --nav-bg: #0b1220;
+  --text: #0f172a;
+}
+
+*{ box-sizing: border-box; }
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Inter, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.571;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* 数字、编码类字段统一等宽（DESIGN.md §3）。 */
+code, kbd, .mono, [data-mono] {
+  font-family: "IBM Plex Mono", "JetBrains Mono", Consolas, monospace;
+  font-feature-settings: "tnum" 1;
+}
+
+/* 表单 label 颜色（与 DESIGN.md §2.4 次文本一致）。 */
+.ant-form-item-label > label { color: #475569; }
+
+/* 键盘 focus：企业系统必须看得见。 */
+:focus-visible {
+  outline: 2px solid var(--brand-weak);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* 前端可选的动效极简：登录卡片入场一次。 */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.rise { animation: rise 300ms ease-out both; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

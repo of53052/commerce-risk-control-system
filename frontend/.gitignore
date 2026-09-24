@@ -1,0 +1,9 @@
+/node_modules
+/dist
+/dist-ssr
+*.local
+.vite
+# tsc 增量缓存与误编译产物（vite.config.ts 只应保留 .ts 源）
+tsconfig.tsbuildinfo
+vite.config.d.ts
+vite.config.js
