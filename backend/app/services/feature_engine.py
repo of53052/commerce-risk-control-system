@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any, Literal
 
 from sqlalchemy import func, or_, select
@@ -159,7 +160,7 @@ FEATURE_REGISTRY: tuple[FeatureSpec, ...] = (
 
     # ---- 主体画像 ----
     FeatureSpec("account_age_days", "profile", description="账号注册天数"),
-    FeatureSpec("subject_case_cnt", "profile", description="近 30 天该主体风险案件数（P1 案件表就绪后接入）"),
+    FeatureSpec("subject_case_cnt", "profile", description="近 30 天该主体风险案件数（P1 起读 rc_case，含已处置/已归档）"),
     FeatureSpec("night_activity_ratio", "profile", description="夜间（0-6 点）行为占比（P0 为当前事件二值化口径）"),
     FeatureSpec("device_new_account_cnt", "profile", description="同设备新账号数（device_new_account_ratio 的分子）"),
 
@@ -282,10 +283,12 @@ def active_windows(db: Session | None) -> dict[str, int]:
 def known_feature_keys(db: Session | None = None) -> set[str]:
     """规则校验用的字段白名单。
 
-    刻意包含**尚未实现口径**的特征（如 subject_case_cnt）：规则可以先写好、
-    等数据就绪后自动生效，而不会因为"字段未注册"被拒。
-    代价是这类规则在数据缺失期恒不命中 —— 由 missing_fields 留痕暴露，
-    属于可接受的策略前置。
+    刻意包含**口径会随阶段演进**的特征：规则可以先写好、等数据就绪后自动生效，
+    而不会因为"字段未注册"被拒。典型案例是 ``subject_case_cnt`` ——
+    P0 期案件表还不存在，它恒为 0 并记 missing_fields；P1 起改读 rc_case
+    的真实计数，引用它的规则**无需改动就开始工作**，这正是当初允许
+    "引用未就绪字段"的意义。代价是数据缺失期规则恒不命中，由
+    missing_fields 留痕暴露，属于可接受的策略前置。
 
     同时并入**名单服务产出的标记键**（subject_blacklist / subject_gray_flag 等）：
     它们不是窗口聚合，因此不在本模块的注册表里，但规则确实可以引用
@@ -593,9 +596,37 @@ def _compute_business_features(
     # 因此用"当前账号是否新账号"近似（0/1），并在交付说明中标注为已知简化。
     result.features["device_new_account_cnt"] = 1 if (result.features.get("account_age_days") or 0) < 7 else 0
 
-    # ---- 近 30 天案件数：案件表属 P1，P0 固定 0 ----
-    result.features["subject_case_cnt"] = 0
-    _mark_missing(result, "subject_case_cnt")
+    # ---- 近 30 天案件数（P1 起接真实案件表）----
+    result.features["subject_case_cnt"] = _recent_case_count(db, user_id=user_id, now=now)
+
+
+def _recent_case_count(db: Session, *, user_id: str, now, days: int = 30) -> int:
+    """近 N 天该主体被建案的次数（rc_case）。
+
+    P0 时期这一项恒为 0 并记 missing（当时案件表还不存在）。恒为 0 的特征比
+    "多一次查询"危险得多：它会让所有引用它的规则**永远不触发**，而规则页面
+    上看起来完全正常 —— 这类"静默失效"正是本文件反复强调要避免的。
+
+    口径：**含已处置与已归档的案件**。"被风控盯上过几次"是客观事实，
+    不会因为后来判定为误报就消失；真正要过滤误报的场景应该在规则里显式
+    引用处置结论，而不是让计数替它做决定。
+
+    成本：一次前缀命中 ``(subject_type, subject_value, ...)`` 索引的 COUNT，
+    在决策热路径上约占零点几毫秒（本进程单实例、每事件一次）。
+    """
+    from app.models.case import SUBJECT_USER, RcCase  # 局部导入：避免模型域循环引用
+
+    since = now - timedelta(days=days)
+    count = db.execute(
+        select(func.count())
+        .select_from(RcCase)
+        .where(
+            RcCase.subject_type == SUBJECT_USER,
+            RcCase.subject_value == user_id,
+            RcCase.created_at >= since,
+        )
+    ).scalar_one()
+    return int(count or 0)
 
 
 def _env_risk_score(fingerprint: Any) -> int:

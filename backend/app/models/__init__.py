@@ -12,6 +12,12 @@ from app.models.biz import (
     BizProduct,
     BizRefund,
 )
+from app.models.case import (
+    RcCase,
+    RcCaseAction,
+    RcCaseActionItem,
+    RcCaseEvent,
+)
 from app.models.decision import (
     RcDecision,
     RcDecisionHit,
@@ -45,6 +51,11 @@ __all__ = [
     "RcRule",
     "RcRuleVersion",
     "RcListEntry",
+    # 案件域
+    "RcCase",
+    "RcCaseEvent",
+    "RcCaseAction",
+    "RcCaseActionItem",
     # 审计
     "RcAuditLog",
 ]

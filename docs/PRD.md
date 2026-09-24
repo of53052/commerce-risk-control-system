@@ -372,6 +372,21 @@ device_account_cnt_24h >= 3 and user_coupon_cnt_1h > 5 and account_age_days < 7
 - 窗口内重复触发 → 不新建案件，累加到既有案件：`hit_cnt + 1`、`event_cnt + 1`、刷新 `max_score` 与 `last_at`，并把新事件挂到 `rc_case_event`。
 - 案件字段：案件编号、主体、场景、状态、风险等级、最高分、命中次数、关联事件数、首次/末次触发时间、当前处理人、创建时间。
 
+**实现口径（P1 实装时确认，与本节措辞的差异见 docs/ARCHITECTURE.md §19.8）**：
+
+- **主体类型固定为 `user`**：处置动作（拉黑账号 / 封设备 / 取消订单）最终都通过账号的关联事件溯源；
+  按设备或 IP 建案会把多个账号的风险混进同一个案件，处置时无法判断该拉黑谁。
+- **案件编号 = `C{yyyyMMddHHMMSS}{进程盐}{6位序号}`**：与决策编号同构。刻意不用"日内序列"或
+  "时间戳 + 随机后缀" —— 后者在同秒并发下会撞唯一索引，决策编号已经踩过这个坑。
+- **窗口锚点是事件的业务时间**（`occurred_at`），不是处理时刻；`last_at` 取"既有值与新事件时间的较大者"，
+  补投递的旧事件不能让末次触发时间倒退。
+- **计数口径分开**：`event_cnt` = 关联事件数（"被盯上过几次"），`hit_cnt` = 累计命中规则条数
+  （"一共踩了多少条规则"）。合成一个字段后，工作台无法回答"是一次触发踩了 3 条规则，还是触发了 3 次"。
+- **窗口外允许同主体同场景存在多个未结案件**：这是"10 点触发一次、11 点又触发一次"的正常表达；
+  强行并成一个会让上一次已完成的处置结论被新证据污染。
+- **建案写审计（`case_create`，操作者为 `system`），合案不写**：合案发生在决策热路径上，
+  逐次写审计会让哈希链的串行写成为吞吐瓶颈；合案痕迹由 `rc_case_event` 承担。
+
 ### 9.2 状态机
 
 ```
@@ -385,6 +400,25 @@ device_account_cnt_24h >= 3 and user_coupon_cnt_1h > 5 and account_age_days < 7
 | `processing → disposed` | 当前 `handler` | 已填写业务结论与至少一个风控动作 | 执行处置联动（§9.4），入审计 |
 | `disposed → archived` | admin 手动归档（支持批量） | 无 | 入审计 |
 | `pending/processing → closed` | admin | 需填原因 | 入审计 |
+
+**实现口径（P1）**：状态迁移一律用条件更新（`UPDATE ... WHERE case_no=? AND status=?`），
+影响行数为 0 即冲突 —— "先查后改"在两个人同时点"接手"时会让后手也拿到 `pending`，
+然后两人同时进入处理态。冲突的错误码与提示：
+
+| 场景 | 错误码 | 提示 |
+| --- | --- | --- |
+| 案件不存在 | `40404` | 案件不存在：C... |
+| 已被他人接手 / 状态不允许（已处置、已关闭、已归档） | `40902` | 案件已被 XXX 接手 / 案件已处置，不能重复提交 |
+| 未接手就想处置（auditor） | `40902` | 案件尚未接手，请先接手后再提交处置 |
+| 处置他人接手的案件 | `40302` | 只有当前处理人才能处置该案件 |
+
+校验顺序是**状态先于权限**：`pending` 案件的 `handler_id` 为空，若先判"非当前处理人"，
+没接手的审核员会收到一个指向错误方向的提示（详见 docs/ARCHITECTURE.md §19.8）。
+另外 **admin 是兜底例外**：可直接处置 `pending` 案件，也可处置他人接手的案件（审计里角色可区分）。
+
+**批量归档的错误语义**：`POST /api/v1/cases/archive` 逐条独立判定，响应恒 200 并返回
+`{total, ok, results[]}`（每条含 `case_no / ok / reason`）。把"10 条里有 1 条状态不符"
+变成整批失败，会让操作者反复重试并最终退回手工逐条点。
 
 ### 9.3 处置结论（双维度）
 
@@ -418,6 +452,24 @@ device_account_cnt_24h >= 3 and user_coupon_cnt_1h > 5 and account_age_days < 7
 | `watchlist_add` | 新增 `rc_list_entry`（gray/user） |
 
 所有联动结果写入 `rc_case_action_item` 与审计日志；联动失败不阻塞处置提交，但记录失败原因并在界面提示。
+
+**实现口径（P1）**：每个动作的落库结果分三档，界面逐项展示：
+
+| `exec_result` | 含义 | 例子 |
+| --- | --- | --- |
+| `success` | 已执行 | 未支付订单被置为 `cancelled`；黑名单写入；业务用户置黑 |
+| `skipped` | 前置不满足，无对象可执行 | 案件无关联订单；订单已支付（需人工退款）；事件无设备号；退款单已审核过 |
+| `failed` | 数据不一致，需人工介入 | 事件引用的订单号在业务表里查不到 |
+
+三档划分的意义：`skipped` 是**预期内的业务状态**，`failed` 是**需要排查的异常**。
+若都记成"失败"，运维会把正常的"订单已支付"当成系统故障；若都记成"成功"，
+真正的数据不一致会被静默吞掉。响应 HTTP 恒为 200 —— 处置结论本身是成功的，
+联动是执行动作，两者的成败必须分开表达。
+
+另外两条：**联动目标只取案件证据链上的单据**（`rc_case_event.biz_no`），
+不按主体全量扫（否则会把同一账号的正常订单一起取消）；**`reject` + 售后场景**
+的退款驳回由业务结论驱动，在明细里以 `risk_action="reject_refund"` 单列，
+排在人工勾选项之后，避免看起来像"人工勾了驳回退款"。
 
 ---
 
@@ -515,9 +567,10 @@ device_account_cnt_24h >= 3 and user_coupon_cnt_1h > 5 and account_age_days < 7
 | `POST /api/v1/events`、`/events/batch` | 事件接入（决策） | API Key |
 | `GET /api/v1/decisions`、`/{id}` | 决策查询与详情（含命中、特征、模型判据） | 登录 |
 | `GET /api/v1/cases`、`/{case_no}` | 案件列表与详情（含画像、特征、图谱数据） | 登录 |
-| `POST /api/v1/cases/{case_no}/claim` | 接手案件 | auditor/admin |
-| `POST /api/v1/cases/{case_no}/dispose` | 提交处置 | auditor/admin |
-| `POST /api/v1/cases/{case_no}/archive` | 归档（支持批量） | admin |
+| `POST /api/v1/cases/{case_no}/claim` | 接手案件（条件更新；冲突返回 409 + 当前处理人） | auditor/admin |
+| `POST /api/v1/cases/{case_no}/dispose` | 提交处置（双维度结论 + 联动，逐项返回执行结果） | auditor/admin |
+| `POST /api/v1/cases/{case_no}/archive`、`/cases/archive` | 单个 / 批量归档（批量逐条返回成败） | admin |
+| `POST /api/v1/cases/{case_no}/close` | 强制关闭（需填原因） | admin |
 | `GET/POST/PUT /api/v1/rules`、`/{code}/toggle`、`/{code}/versions`、`/{code}/rollback` | 规则管理 | strategist/admin |
 | `POST /api/v1/rules/validate` | 表达式/条件树试算校验 | strategist/admin |
 | `GET/POST/DELETE /api/v1/lists`、`/lists/import`、`/lists/imports/{id}` | 名单管理 | strategist/admin |
@@ -631,7 +684,7 @@ P0 落地的 8 个配置键。**代码侧权威定义在 `backend/app/services/c
 | 阶段 | 交付物 | 可验证形式 |
 | --- | --- | --- |
 | **P0** | 库表与迁移、种子数据（3 账号 / 20 规则 / 名单 / API Key）、模拟业务端、事件网关、特征引擎、名单+规则+模型+融合、决策落库与幂等、审计链、单元与集成测试 | `scripts/init_db.ps1` + `scripts/verify_p0.ps1` 全绿；pytest 通过 |
-| **P1** | 案件流转（合案 + 状态机）、处置联动、审核工作台页面 | 工作台完成一次"接手 → 查看证据 → 处置 → 订单/退款联动生效"闭环 |
+| **P1** | 案件流转（合案 + 状态机）、处置联动、审核工作台页面 | `scripts/verify_p1.ps1` 36 项断言全绿（业务动作 → 建案 → 查看证据 → 接手 → 处置 → 订单/退款联动生效 → 归档 → 审计链校验） |
 | **P2** | 大盘（SSE）、策略与规则配置页、事件仿真页、审计与模型页、监控预聚合 | 六个页面可交互；审计链校验可演示断裂检测 |
 | **P3** | 全量数据集（5 万事件）、两个作弊场景脚本、脚本化验收清单、README 与演示手册 | 按验收清单逐条复跑通过 |
 
@@ -640,6 +693,16 @@ P0 落地的 8 个配置键。**代码侧权威定义在 `backend/app/services/c
 > 脚本化验收清单（`docs/P0-验收清单.md`）。提前的原因：P0 的模型引擎需要
 > "数据集 → 训练 → 模型在决策链路上真的生效"这条端到端证据，否则只能交付
 > "代码写完但没验证过"的模型层。P3 因此保留：README、演示手册与最终全量复跑。
+
+> **P1 交付边界（2026-09-24 更新）**：P1 拆成两段推进，避免"后端接口没人用、
+> 前端页面没数据"的互相等待。
+>
+> * **P1-a（已完成）**：案件四表 + Alembic 迁移、建案与合案、状态机（含并发冲突语义）、
+>   处置联动五动作、案件接口七个（列表/详情/接手/处置/单个归档/批量归档/强制关闭）、
+>   `verify_p1.ps1` 端到端验收脚本；56 项案件域 pytest，全量 244 项通过。
+> * **P1-b（待做）**：审核工作台前端三栏联调（§11.3）、`DESIGN.md` 中工作台部分的落地。
+>   后端的详情接口已经把工作台中栏需要的六块数据（画像 / 单据 / 特征分组 / 图谱 /
+>   证据链 / 时间线）一次返回，前端不需要再拼多个接口。
 
 ### 17.2 验收标准映射（`项目实战.md` §2.3.10）
 
@@ -692,6 +755,29 @@ P0 落地的 8 个配置键。**代码侧权威定义在 `backend/app/services/c
 | `rc_list_entry` | id, list_type, dimension, value, priority, reason, source, expire_at, status, created_by, created_at, updated_at（`list_type+dimension+value` 唯一） |
 | `rc_model_version` | id, version(uk), file_path, feature_names(json), metrics(json), sample_count, trained_at, active, remark, created_at |
 | `rc_audit_log` | id, actor_id, actor_name, role, action, target_type, target_id, before_json, after_json, reason, prev_hash, hash, created_at |
+
+## 附录 A-1：P1 库表清单（案件域）
+
+由迁移 `7e9dc8ec3f41`（`backend/alembic/versions/20260924_1950_7e9dc8ec3f41_p1_case_tables.py`）创建，
+纯新增、不触碰任何 P0 表。字段的取舍理由见 `backend/app/models/case.py` 与
+`docs/ARCHITECTURE.md` §19.8。
+
+| 表 | 关键字段 | 说明 |
+| --- | --- | --- |
+| `rc_case` | id, case_no(uk), subject_type, subject_value, scene, status, risk_level, max_score, hit_cnt, event_cnt, first_at, last_at, last_event_id, last_decision_id, handler, handler_id, claimed_at, disposed_at, archived_at, closed_at, close_reason, dispose_result, created_at, updated_at | 一个待办案件。`risk_level / max_score / hit_cnt / event_cnt` 是**刻意为列表页做的冗余**：工作台每次都要展示它们，回查 `rc_decision_hit` 聚合会退化成 N+1，而它们只在合案时变一次 |
+| `rc_case_event` | id, case_no, event_id, decision_id, event_type, scene, action, risk_level, risk_score, hit_count, biz_no, occurred_at（`case_no + event_id` 唯一） | 案件与事件的关联（证据时间线）。`biz_no` 是处置联动定位订单/退款单的依据 |
+| `rc_case_action` | id, case_no, business_result, risk_actions(json), remark, operator_id, operator_name, actor_role, status_before, status_after, created_at | 一次处置提交（双维度结论 + 备注 ≥10 字 + 前后状态） |
+| `rc_case_action_item` | id, action_id, case_no, risk_action, exec_result, target_type, target_id, detail(json), created_at | 一项风控动作的执行结果。`target_type/target_id` 回答"这次动作改了哪一行" |
+
+索引要点：`rc_case(case_no)` 唯一；`rc_case(subject_type, subject_value, scene, status, last_at)`
+（合案候选查询与主体历史）、`rc_case(status, last_at)`（列表默认排序）、
+`rc_case(scene, status, last_at)`、`rc_case(handler_id, status)`（"我的案件"）；
+`rc_case_event(case_no, event_id)` 唯一、`rc_case_event(case_no, occurred_at)`（时间线）；
+`rc_case_action(case_no, created_at)`、`rc_case_action_item(action_id)` / `(case_no)`。
+
+**`rc_decision.case_no` 在 P0 就已建好**（当时恒为 NULL），因此 P1 不需要给决策表加字段；
+历史决策的 `case_no` 保持 NULL —— 它表示"那条决策发生在案件功能上线之前"，
+与"属于某案件但没记上"是两件事。
 
 ## 附录 B：仓库文件清单（P0 目标态）
 

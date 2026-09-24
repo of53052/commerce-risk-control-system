@@ -52,11 +52,13 @@ class ErrorCode:
 
     # ---- 403xx 权限 ----
     PERMISSION_DENIED = "40301"
+    CASE_HANDLER_MISMATCH = "40302"
 
     # ---- 404xx 资源不存在 ----
     RESOURCE_NOT_FOUND = "40401"
     EVENT_ORDER_NOT_FOUND = "40402"
     EVENT_REFUND_NOT_FOUND = "40403"
+    CASE_NOT_FOUND = "40404"
 
     # ---- 409xx 冲突 ----
     EVENT_DUPLICATED = "40901"
@@ -84,9 +86,11 @@ HTTP_STATUS_BY_CODE: dict[str, int] = {
     ErrorCode.ACCOUNT_DISABLED: 403,
     ErrorCode.CREDENTIAL_INVALID: 401,
     ErrorCode.PERMISSION_DENIED: 403,
+    ErrorCode.CASE_HANDLER_MISMATCH: 403,
     ErrorCode.RESOURCE_NOT_FOUND: 404,
     ErrorCode.EVENT_ORDER_NOT_FOUND: 404,
     ErrorCode.EVENT_REFUND_NOT_FOUND: 404,
+    ErrorCode.CASE_NOT_FOUND: 404,
     ErrorCode.EVENT_DUPLICATED: 409,
     ErrorCode.STATE_CONFLICT: 409,
     ErrorCode.SYSTEM_ERROR: 500,

@@ -22,6 +22,7 @@ from redis import Redis
 from sqlalchemy import text
 
 from app.api import auth as auth_api
+from app.api import cases as cases_api
 from app.api import events as events_api
 from app.api.errors import register_exception_handlers
 from app.core.config import settings
@@ -66,6 +67,7 @@ async def trace_id_middleware(request: Request, call_next):
 # ---- 路由注册 ----
 app.include_router(auth_api.router)
 app.include_router(events_api.router)
+app.include_router(cases_api.router)
 
 
 @app.get("/healthz", tags=["system"], summary="健康检查")

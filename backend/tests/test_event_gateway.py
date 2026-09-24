@@ -29,6 +29,7 @@ from app.core.timeutil import utcnow
 from app.db.session import get_db
 from app.expression import node_to_dict, parse
 from app.models.biz import BizCustomer, BizOrder
+from app.models.case import RcCase
 from app.models.decision import RcDecision, RcDecisionHit, RcModelContribution
 from app.models.event import RcEvent, RcFeatureSnapshot
 from app.models.rclist import DIM_USER, LIST_BLACK, LIST_WHITE, STATUS_ACTIVE, RcListEntry
@@ -42,6 +43,12 @@ pytestmark = pytest.mark.integration
 # 每个测试前清空的表：既包含决策产物，也包含策略与业务单据 ——
 # 让每个测试从"空策略 + 默认配置"起步，结论只依赖该测试自己造的数据。
 _TRUNCATE_TABLES = (
+    # 案件四表：P1 起 Review/Reject 会真实建案，不清空则上一个用例的案件
+    # 会被下一个用例合案（表现为 event_cnt 比预期大），断言随之飘。
+    "rc_case",
+    "rc_case_event",
+    "rc_case_action",
+    "rc_case_action_item",
     "rc_event",
     "rc_feature_snapshot",
     "rc_decision",
@@ -250,15 +257,16 @@ def test_duplicate_event_falls_back_to_db_when_cache_cleared(gw_db: Session, red
 
 
 def test_review_path_when_score_reaches_review_threshold(gw_db: Session) -> None:
-    """规则分达到审核阈值（默认 60）-> Review，并说明 P0 未建案。"""
+    """规则分达到审核阈值（默认 60）-> Review，P1 起真实建案。"""
     add_rule(gw_db, code="RC-T-REVIEW", text="user_login_cnt_24h >= 1", score=70)
     result = event_gateway.handle_event(gw_db, event=make_event(event_type="login"))
 
     assert result.response["action"] == "Review"
     assert result.response["risk_level"] == "mid"
     assert result.response["risk_score"] == 70
-    assert result.response["case_no"] is None
-    assert any("P0 未生成案件" in note for note in result.response["notes"])
+    assert result.response["case_no"] is not None
+    assert result.response["case_no"].startswith("C")
+    assert any("已生成案件" in note for note in result.response["notes"])
     assert count_rows(gw_db, RcDecisionHit) == 1
     hit = gw_db.execute(select(RcDecisionHit)).scalar_one()
     assert hit.rule_code == "RC-T-REVIEW"
@@ -291,7 +299,7 @@ def test_challenge_only_when_rule_declares_it(gw_db: Session) -> None:
     assert challenged.response["action_hint"] == "challenge"
     assert challenged.response["risk_level"] == "mid"
     assert challenged.response["case_no"] is None
-    assert not any("P0 未生成案件" in note for note in challenged.response["notes"])
+    assert not any("已生成案件" in note or "合并到案件" in note for note in challenged.response["notes"])
 
 
 def test_review_is_default_in_mid_band(gw_db: Session) -> None:
@@ -300,6 +308,52 @@ def test_review_is_default_in_mid_band(gw_db: Session) -> None:
     result = event_gateway.handle_event(gw_db, event=make_event(event_type="login"))
     assert result.response["action"] == "Review"
     assert result.response["action_hint"] == "none"
+
+
+def test_reject_creates_case_and_merges_within_window(gw_db: Session) -> None:
+    """P1 闭环：Reject 建案并把 case_no 写回决策与响应；窗口内第二次触发合并。
+
+    这条测试是"决策 → 案件"的接缝证据：链路两侧各自的单测都通过，
+    但接缝没接上（case_no 恒为 None）时只有它会把问题暴露出来。
+    """
+    add_rule(gw_db, code="RC-T-CASE", text="user_login_cnt_24h >= 1", score=85)
+
+    first = event_gateway.handle_event(
+        gw_db, event=make_event(event_type="login", event_id="EVT-CASE-1", user_id="U9")
+    )
+    assert first.response["action"] == "Reject"
+    assert first.case_no is not None
+    assert first.response["case_no"] == first.case_no
+
+    decision = gw_db.execute(select(RcDecision)).scalars().all()
+    assert len(decision) == 1
+    assert decision[0].case_no == first.case_no
+
+    second = event_gateway.handle_event(
+        gw_db,
+        event=make_event(
+            event_type="login",
+            event_id="EVT-CASE-2",
+            user_id="U9",
+            occurred_at=utcnow() + timedelta(minutes=1),
+        ),
+    )
+    # 同主体同场景在合案窗口内 -> 复用同一个案件
+    assert second.case_no == first.case_no
+    assert any("合并到案件" in note for note in second.response["notes"])
+    case_row = gw_db.execute(select(RcCase)).scalar_one()
+    assert case_row.event_cnt == 2
+    assert case_row.hit_cnt == 2
+
+
+def test_pass_does_not_create_case(gw_db: Session) -> None:
+    """通过的事件不建案（否则人工队列会被低风险流量淹没）。"""
+    result = event_gateway.handle_event(
+        gw_db, event=make_event(event_type="login", event_id="EVT-PASS-1")
+    )
+    assert result.response["action"] == "Pass"
+    assert result.case_no is None
+    assert gw_db.execute(select(func.count()).select_from(RcCase)).scalar_one() == 0
 
 
 

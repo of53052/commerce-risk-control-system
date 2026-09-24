@@ -25,8 +25,9 @@
 4. **条带写入用事件自身时间戳**，且必须在决策之后（特征计算时当前事件还未入条带，
    由特征引擎自行把当前事件计入，见 feature_engine._compute_sum 的注释）。
 
-已知 P0 限制：``Review`` / ``Reject`` 应生成案件（PRD §9.1），但案件表属 P1，
-因此 P0 只产出决策、``case_no`` 留空，并在此处记 ``notes`` 说明。
+P1 起，``Review`` / ``Reject`` 会真实建案（docs/PRD.md §9.1），由
+``app/services/case_service.py`` 在本事务里完成合案与挂载 ``rc_case_event``；
+``case_no`` 同时落 ``rc_decision.case_no`` 与响应体，供业务方追踪人工复核进度。
 """
 
 from __future__ import annotations
@@ -49,6 +50,7 @@ from app.core.timeutil import to_ms
 from app.db.redis_client import IDEM_TTL, get_redis, idem_key
 from app.models.event import RcEvent, RcFeatureSnapshot
 from app.services import (
+    case_service,
     decision_serializer,
     event_validator,
     feature_engine,
@@ -134,12 +136,6 @@ def new_decision_id(occurred_at: datetime | None = None) -> str:
     """
     ts = (occurred_at or datetime.utcnow()).strftime(_ID_TIME_FORMAT)
     return f"D{ts}{_ID_PROCESS_SALT}{next(_ID_COUNTER):06d}"
-
-
-def new_case_no(occurred_at: datetime | None = None) -> str:
-    """生成案件编号（P1 实装合案时使用；P0 仅预留格式与调用点）。"""
-    ts = (occurred_at or datetime.utcnow()).strftime("%Y%m%d%H%M%S")
-    return f"C{ts}{secrets.randbelow(10000):04d}"
 
 
 # --------------------------------------------------------------------------- #
@@ -288,8 +284,27 @@ def handle_event(db: Session, *, event: Any, commit: bool = True) -> DecisionRes
     latency_ms = int((time.perf_counter() - started) * 1000)
     case_no: str | None = None
     if fusion.needs_case(fusion_result):
-        # P0 未实装案件表：这里只留痕，P1 接入 rc_case 后改为真实合案
-        notes.append("P0 未生成案件（案件流转属 P1 阶段）")
+        merge_result = case_service.merge_or_create(
+            db,
+            subject_value=event.user_id,
+            scene=scene,
+            event_id=event.event_id,
+            decision_id=decision_id,
+            event_type=event.event_type,
+            action=fusion_result.action,
+            risk_level=fusion_result.risk_level,
+            risk_score=fusion_result.risk_score,
+            hit_count=len(rule_eval.hits),
+            biz_no=_biz_no(event),
+            occurred_at=event.occurred_at,
+        )
+        case_no = merge_result.case_no
+        if merge_result.created:
+            notes.append(f"已生成案件 {case_no}")
+        else:
+            notes.append(
+                f"已合并到案件 {case_no}（累计关联 {merge_result.event_cnt} 次事件）"
+            )
 
     decision_row = decision_serializer.build_decision_row(
         decision_id=decision_id,
