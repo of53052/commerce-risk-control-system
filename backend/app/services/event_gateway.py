@@ -581,6 +581,38 @@ def _window_profile(db: Session) -> str:
     return "+".join(sorted(windows.keys())) or "default"
 
 
+def entities_of(
+    *,
+    user_id: str | None,
+    phone: str | None,
+    device_id: str | None,
+    ip: str | None,
+    address_hash: str | None = None,
+) -> list[tuple[str, str]]:
+    """一条事件涉及哪些「实体 × 实体 ID」（确定落哪几条条带）。
+
+    地址是**可选**维度：注册等早期事件可能还没有收货地址，此时不写地址条带
+    （写空字符串会造出一个名为 ``""`` 的实体，让 ``address_*`` 特征把全站
+    事件都算到同一个假地址上）。
+
+    取值为空（None / 空串）的实体由 ``window_store.add_event_to_entities``
+    统一跳过，这里不做过滤，保持"清单 = 语义维度"的直观对应。
+
+    抽成公开函数是为了让 ``scripts/rebuild_windows.py``（按历史事件重放条带）
+    与在线写入**共用同一份清单**：两份拷贝各自演化时，重放出的条带会与在线
+    不一致，而重建脚本的本意恰恰是"让条带与库内数据一致"。
+    """
+    entities: list[tuple[str, str]] = [
+        (window_store.ENTITY_USER, user_id),
+        (window_store.ENTITY_PHONE, phone),
+        (window_store.ENTITY_DEVICE, device_id),
+        (window_store.ENTITY_IP, ip),
+    ]
+    if address_hash:
+        entities.append((window_store.ENTITY_ADDRESS, address_hash))
+    return entities
+
+
 def _write_windows(event: Any, *, payload: dict[str, Any]) -> None:
     """把事件写进「多实体 × 多窗口」条带。
 
@@ -591,20 +623,22 @@ def _write_windows(event: Any, *, payload: dict[str, Any]) -> None:
     而计数翻倍不会报错，只会让规则阈值静默减半。
 
     需要主体标识的实体来自注册表（``distinct_subject_entities``），
-    与读取侧同源，避免两边各维护一份清单后漂移。
+    与读取侧同源，避免两边各维护一份清单后漂移；
+    "事件 → 实体清单"则统一由 ``entities_of`` 给出（重放脚本复用同一份）。
     """
     try:
         windows = feature_engine.DEFAULT_WINDOWS
         ts_ms = to_ms(event.occurred_at)
         amount = _amount_of(event, payload)
 
-        entities: list[tuple[str, str]] = [(window_store.ENTITY_USER, event.user_id)]
-        entities.append((window_store.ENTITY_PHONE, event.phone))
-        entities.append((window_store.ENTITY_DEVICE, event.device.device_id))
-        entities.append((window_store.ENTITY_IP, event.network.ip))
         address_hash = getattr(event.address, "address_hash", None) if event.address else None
-        if address_hash:
-            entities.append((window_store.ENTITY_ADDRESS, address_hash))
+        entities = entities_of(
+            user_id=event.user_id,
+            phone=event.phone,
+            device_id=event.device.device_id,
+            ip=event.network.ip,
+            address_hash=address_hash,
+        )
 
         # 主体标识：目前全部聚簇特征都是"按用户去重同设备/同 IP/同地址"，
         # 因此主体就是当前事件的用户；若将来出现"按设备去重用户"这类反向聚簇，

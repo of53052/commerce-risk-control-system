@@ -10,6 +10,7 @@
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     Index,
     Integer,
@@ -66,6 +67,11 @@ class RcEvent(Base):
     occurred_at: Mapped[object] = mapped_column(DateTime, nullable=False, comment="业务发生时间（UTC）")
     received_at: Mapped[object] = mapped_column(DateTime, default=utcnow, nullable=False, comment="风控接收时间（UTC）")
     source: Mapped[str] = mapped_column(String(16), default=SOURCE_REAL, nullable=False)
+    is_cheat: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+        comment="离线训练标签：1=作弊账号产生，0=正常账号产生，NULL=线上真实事件（不参与训练）",
+    )
     payload: Mapped[dict] = mapped_column(JSON, nullable=False, comment="事件类型专有字段原样留存，保证可回放")
     latency_ms: Mapped[int | None] = mapped_column(Integer, comment="接入到响应的耗时；异步回填")
     created_at: Mapped[object] = mapped_column(DateTime, default=utcnow, nullable=False)

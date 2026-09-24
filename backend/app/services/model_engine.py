@@ -16,9 +16,13 @@
       "metrics": {...}, "label_definition": "..."
     }
 
-**缺失特征用训练均值填充**（等价于标准化后取 0），并记入 ``imputed_fields``；
-绝不悄悄填 0 —— 填 0 在 log1p 与 z-score 之后是一个有明确含义的值
-（"该特征处于样本最小值附近"），会让模型给出一个看似正常但完全错误的分。
+**缺失特征取标准化后的 0**（即训练均值所在的位置，该维度不贡献分数），
+并记入 ``imputed_fields``；绝不悄悄按 0 处理 —— 0 在 log1p 与 z-score 之后
+是一个有明确含义的值（"该特征处于样本最小值附近"），
+会让模型给出一个看似正常但完全错误的分。
+
+``mean`` / ``std`` 存的是**变换后**（log1p 之后）空间的统计量，
+因此缺失分支必须直接跳过变换（详见 ``predict`` 里的注释）。
 """
 
 from __future__ import annotations
@@ -200,13 +204,17 @@ def predict(
     for index, name in enumerate(model.feature_names):
         raw = features.get(name)
         if raw is None or not isinstance(raw, (int, float)):
-            # 缺失或非数值：用训练均值填充（标准化后即 0），并留痕
+            # 缺失或非数值：直接取 z = 0（即训练均值所在的位置）并留痕。
+            #
+            # 这里**不能**先把均值填进去再走下面的变换：``mean`` 存的是**变换后**
+            # 空间的均值，若再对它做一次 log1p，缺失样本会被推到分布之外，
+            # 得到"看着正常但没道理"的分数。缺失即中性是唯一可解释的口径：
+            # 模型对该特征没有信息 → 该维度不贡献分数。
             imputed.append(name)
-            mean_value = model.mean[index]
-            value = mean_value
-        else:
-            value = float(raw)
+            z_values.append(0.0)
+            continue
 
+        value = float(raw)
         if model.log1p:
             # log1p 需要非负输入；负值在业务上不该出现（计数/金额/比率都 ≥0），
             # 出现即视为脏数据，按 0 处理并留痕，避免 math domain error 打挂推理。
@@ -270,4 +278,3 @@ def reset() -> None:
     global _active, _load_failed
     _active = None
     _load_failed = None
-

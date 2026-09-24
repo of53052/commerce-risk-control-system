@@ -93,9 +93,16 @@ class BusinessSimulator:
     （漏调风控的表现是"这个动作永远不被拦"，从日志上看不出来）。
     """
 
-    def __init__(self, db: Session, *, source: str = "simulation") -> None:
+    def __init__(self, db: Session, *, source: str = "simulation", autocommit: bool = True) -> None:
+        """``autocommit=False`` 时由调用方掌管事务（数据集生成器需要批量提交）。
+
+        为什么需要它：数据集生成要跑几万条事件，逐条 commit 会把吞吐压在
+        40 事件/秒上下；批量提交把事务次数降到 1/100。这里不引入"每 N 条自动提交"
+        之类的隐式行为 —— 提交时机是调用方的策略，模拟端只负责不再擅自提交。
+        """
         self.db = db
         self.source = source
+        self.autocommit = autocommit
 
     # ------------------------------------------------------------------ #
     # 业务动作
@@ -122,7 +129,7 @@ class BusinessSimulator:
             status=CUSTOMER_NORMAL,
         )
         self.db.add(customer)
-        self.db.commit()
+        self._flush_or_commit()
         return customer
 
     def login(self, actor: Actor, *, occurred_at=None) -> BusinessResult:
@@ -171,7 +178,7 @@ class BusinessSimulator:
                     channel=channel,
                 )
             )
-            self.db.commit()
+            self._flush_or_commit()
         return result
 
     def create_order(
@@ -212,7 +219,7 @@ class BusinessSimulator:
                     address_hash=actor.address.address_hash if actor.address else None,
                 )
             )
-            self.db.commit()
+            self._flush_or_commit()
         return result
 
     def pay_order(self, actor: Actor, *, order_no: str, occurred_at=None) -> BusinessResult:
@@ -240,7 +247,7 @@ class BusinessSimulator:
         result = self._decide(event, biz_no=order_no)
         if result.allowed:
             order.status = ORDER_PAID
-            self.db.commit()
+            self._flush_or_commit()
         return result
 
     def apply_refund(
@@ -283,7 +290,7 @@ class BusinessSimulator:
                     status=REFUND_APPLIED,
                 )
             )
-            self.db.commit()
+            self._flush_or_commit()
         return result
 
     # ------------------------------------------------------------------ #
@@ -291,7 +298,9 @@ class BusinessSimulator:
     # ------------------------------------------------------------------ #
     def _decide(self, event: EventIn, *, biz_no: str | None) -> BusinessResult:
         """交给风控网关，并把 action 翻译成"业务是否放行"。"""
-        outcome = event_gateway.handle_event(self.db, event=event)
+        # commit 交给 _flush_or_commit()：批量模式下由调用方统一提交，
+        # 否则"网关提交了、业务单据还没提交"会留下不一致窗口。
+        outcome = event_gateway.handle_event(self.db, event=event, commit=self.autocommit)
         decision = outcome.response
         action = str(decision.get("action") or "")
         allowed = action != ACTION_REJECT
@@ -307,6 +316,21 @@ class BusinessSimulator:
             decision=decision,
             reason=reason,
         )
+
+    def _flush_or_commit(self) -> None:
+        """按 ``autocommit`` 决定"立即提交"还是"只 flush"（见 ``__init__``）。
+
+        名字刻意带上 ``flush``：单文件模式下它是 commit，批量模式下它只把
+        待写行推给数据库（可回滚），叫 ``_commit`` 会让人误以为"调用即落盘"，
+        进而把"批量中途异常 = 整批回滚"的语义读错。
+        """
+        if self.autocommit:
+            self.db.commit()
+        else:
+            # 批量模式下也要**让本会话能看到刚写入的行**：后续动作（支付/退款）
+            # 需要按单号查订单，只有 flush 之后 SQL 查询才能命中未提交的数据。
+            # 顺带把主键填上，避免模型对象处于"半初始化"状态。
+            self.db.flush()
 
     def _event(
         self,
