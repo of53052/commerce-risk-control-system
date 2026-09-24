@@ -44,6 +44,7 @@ from app.models.event import (
 )
 from app.services import window_store
 from app.services.config_service import get_value
+from app.services.list_service import FLAG_FEATURE_KEYS
 
 logger = logging.getLogger("app.services.feature_engine")
 
@@ -189,8 +190,13 @@ def known_feature_keys(db: Session | None = None) -> set[str]:
     等数据就绪后自动生效，而不会因为"字段未注册"被拒。
     代价是这类规则在数据缺失期恒不命中 —— 由 missing_fields 留痕暴露，
     属于可接受的策略前置。
+
+    同时并入**名单服务产出的标记键**（subject_blacklist / subject_gray_flag 等）：
+    它们不是窗口聚合，因此不在本模块的注册表里，但规则确实可以引用
+    （例如"用户灰名单加成"规则）。白名单必须覆盖"规则能引用的全部字段"，
+    否则合法的名单类规则会在保存时被误拒。
     """
-    return set(registry_keys(_active_windows(db)))
+    return set(registry_keys(_active_windows(db))) | set(FLAG_FEATURE_KEYS)
 
 
 @dataclass

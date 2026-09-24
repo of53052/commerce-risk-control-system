@@ -127,14 +127,25 @@ def test_conflict_policy_configurable(
 
 
 def test_graylist_becomes_feature_flag_only(db, redis_client) -> None:
-    """灰名单不决定动作，只转成加成特征。"""
+    """灰名单不决定动作，只转成加成特征。
+
+    注意：flags 里始终包含全部标记键（未命中为 0/False），
+    这样规则引用 subject_gray_flag 之类字段时永远拿到确定值，不会变成"缺失字段"。
+    """
     db.add(_entry(list_type=LIST_GRAY, dimension="ip", value="10.0.0.9"))
     db.flush()
 
     result = list_service.match(db, subject={"ip": "10.0.0.9"})
     assert result.decision is None
     assert result.decided_by_list is False
-    assert result.flags == {"ip_gray_flag": 1}
+    assert result.flags["ip_gray_flag"] == 1
+    assert result.flags["device_gray_flag"] == 0
+    assert result.flags["subject_blacklist"] is False
+    assert set(result.flags) == {
+        "subject_gray_flag", "phone_gray_flag", "ip_gray_flag",
+        "device_gray_flag", "address_gray_flag",
+        "subject_blacklist", "subject_whitelist",
+    }
 
 
 def test_expired_entry_is_ignored_but_kept(db, redis_client) -> None:
@@ -224,4 +235,3 @@ def test_empty_list_is_cached_to_avoid_penetration(db, redis_client) -> None:
 
     list_service.match(db, subject={"user_id": "U13"})
     assert redis_client.exists(list_key("user", LIST_BLACK)) == 1
-

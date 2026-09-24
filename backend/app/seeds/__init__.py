@@ -19,7 +19,7 @@ from types import ModuleType
 
 from sqlalchemy.orm import Session
 
-from app.seeds import accounts, api_keys, configs
+from app.seeds import accounts, api_keys, configs, rules
 
 
 @dataclass(frozen=True)
@@ -28,9 +28,10 @@ class SeedResult:
     affected: int
 
 
-# 登记顺序即执行顺序：配置 → 账号 → API Key。
-# 后续 P0 步骤会在此追加规则种子（依赖表达式引擎先定型），P1 追加名单种子。
-SEED_MODULES: tuple[ModuleType, ...] = (configs, accounts, api_keys)
+# 登记顺序即执行顺序：配置 → 账号 → API Key → 规则。
+# 规则放最后是因为它的条件要过特征注册表的白名单校验（读 sys_config 的窗口档位），
+# 因此必须在配置写入之后。P1 追加名单种子。
+SEED_MODULES: tuple[ModuleType, ...] = (configs, accounts, api_keys, rules)
 
 
 def run_all(db: Session) -> list[SeedResult]:
@@ -48,4 +49,3 @@ def run_all(db: Session) -> list[SeedResult]:
 
 
 __all__ = ["SEED_MODULES", "SeedResult", "run_all"]
-

@@ -63,6 +63,21 @@ GRAY_FLAG_KEYS: dict[str, str] = {
     "address": "address_gray_flag",
 }
 
+# 名单服务会产出的全部特征键。
+# 用途：
+#   1. 规则字段白名单 —— 规则可以引用名单标记（如 subject_gray_flag == 1），
+#      这些键不在特征注册表里（它们不是窗口聚合，而是名单匹配结果）；
+#   2. 默认值填充 —— 未命中时给 0/False，让规则总能拿到确定值，
+#      而不是"键不存在 → 条件判 false + missing_fields 告警"。
+BLACKLIST_FLAG_KEY = "subject_blacklist"
+WHITELIST_FLAG_KEY = "subject_whitelist"
+
+FLAG_FEATURE_KEYS: tuple[str, ...] = (
+    BLACKLIST_FLAG_KEY,
+    WHITELIST_FLAG_KEY,
+    *GRAY_FLAG_KEYS.values(),
+)
+
 
 @dataclass(frozen=True)
 class ListHit:
@@ -245,14 +260,22 @@ def match(
     result.decision = decision
     result.decided_by_list = decision is not None
 
+    # 先铺满默认值（未命中 = 0/False），再覆盖命中项：
+    # 规则因此总是拿到确定的布尔/数值，不会因为"这次没命中任何名单"
+    # 而把 subject_gray_flag 变成缺失字段。
+    for flag_key in GRAY_FLAG_KEYS.values():
+        result.flags[flag_key] = 0
+    result.flags[BLACKLIST_FLAG_KEY] = False
+    result.flags[WHITELIST_FLAG_KEY] = False
+
     # 灰名单转为加成特征（不决定动作，只提高命中概率）
     for hit in gray_hits:
         flag_key = GRAY_FLAG_KEYS.get(hit.dimension, "subject_gray_flag")
         result.flags[flag_key] = 1
     if black_hits:
-        result.flags["subject_blacklist"] = True
+        result.flags[BLACKLIST_FLAG_KEY] = True
     if white_hits:
-        result.flags["subject_whitelist"] = True
+        result.flags[WHITELIST_FLAG_KEY] = True
 
     return result
 
