@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import logging
+import itertools
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -89,8 +90,21 @@ AMOUNT_FIELD: dict[str, str] = {
     "after_sale_apply": "refund_amount",
 }
 
-# 决策编号的时间格式（业务号生成用）
-_ID_TIME_FORMAT = "%Y%m%d%H%M%S%f"
+# 业务号（决策号/案件号）的唯一性来源：时间戳 + 进程盐 + 进程内自增序号。
+#
+# 时间戳只精确到秒：``app.core.timeutil.utcnow()`` 刻意截掉了微秒
+# （审计哈希链按秒归一，见 audit_service），因此 ``%f`` 恒为 000000，
+# 指望它提供唯一性是错觉。
+#
+# 曾经的实现是"D + 秒级时间戳 + 3 位随机数"，在**同一秒内超过约 40 条决策**时
+# 就会开始撞唯一索引（生日悖论：1000 个取值、140 条记录，撞车概率已接近 1），
+# 而撞车的表现极具误导性 —— 网关把 IntegrityError 一律翻译成
+# "事件编号已存在（并发重复投递）"，于是调用方被告知"换个 event_id 重试"，
+# 而真正重复的是决策号：换个 event_id 重试照样失败。模拟端的批量场景
+# （一秒内近百条事件）立刻把这个设计缺陷打了出来。
+_ID_TIME_FORMAT = "%Y%m%d%H%M%S"
+_ID_PROCESS_SALT = secrets.token_hex(3).upper()
+_ID_COUNTER = itertools.count(1)
 
 
 @dataclass
@@ -108,13 +122,18 @@ class DecisionResult:
 
 
 def new_decision_id(occurred_at: datetime | None = None) -> str:
-    """生成决策编号 D + UTC 时间戳 + 3 位随机后缀。
+    """生成决策编号：``D`` + 秒级 UTC 时间戳 + 进程盐 + 6 位自增序号。
 
     为什么不依赖数据库自增：决策编号要在**落库之前**就返回给业务方（同步响应），
-    而自增 ID 要等到 flush 之后才有。加随机后缀是为了并发同一微秒时不撞唯一索引。
+    而自增 ID 要等到 flush 之后才有。
+
+    为什么不是随机后缀：随机后缀的唯一性随并发量下降得很快（见文件顶部注释），
+    而本函数必须保证"同一秒内任意条数都不重复"。进程内自增序列天然满足这一点，
+    进程盐再把多进程（多 worker）的情形覆盖掉。长度 1+14+6+6 = 27 字符，
+    远小于 ``decision_id`` 列的 varchar(48)，给可读性留了余地（时间戳可读）。
     """
     ts = (occurred_at or datetime.utcnow()).strftime(_ID_TIME_FORMAT)
-    return f"D{ts}{secrets.randbelow(1000):03d}"
+    return f"D{ts}{_ID_PROCESS_SALT}{next(_ID_COUNTER):06d}"
 
 
 def new_case_no(occurred_at: datetime | None = None) -> str:
@@ -305,7 +324,14 @@ def handle_event(db: Session, *, event: Any, commit: bool = True) -> DecisionRes
         if commit:
             db.commit()
     except IntegrityError as exc:
-        # 唯一约束兜底：并发下两个相同 event_id 的请求可能都通过了幂等检查
+        # 唯一约束兜底。**必须先分辨撞的是哪个约束**：
+        #
+        # * 撞 ``rc_event.event_id``：并发下两个相同 event_id 的请求都通过了幂等检查，
+        #   属于正常的"重复投递"，回放首次决策即可，调用方不该收到错误；
+        # * 撞 ``rc_decision.decision_id``：本系统自己的编号生成重复，是**服务端缺陷**。
+        #   若把它也翻译成 EVENT_DUPLICATED，会得到一个指向错误方向的提示 ——
+        #   调用方看到"请使用新的 event_id"，照做之后照样失败（他改的不是问题所在）。
+        #   这正是本函数曾经踩过的坑（旧实现用 3 位随机后缀，同秒并发即撞车）。
         db.rollback()
         stored = decision_serializer.load_decision_payload(db, event.event_id)
         if stored is not None:
@@ -313,6 +339,17 @@ def handle_event(db: Session, *, event: Any, commit: bool = True) -> DecisionRes
             # 不必把"你重试得太快"变成一次 409 让调用方自己处理。
             write_idempotent(event.event_id, stored)
             return _replay(event_id=event.event_id, payload=stored, started=started)
+        if "uq_rc_decision_decision_id" in str(exc.orig):
+            logger.error(
+                "决策编号冲突，疑似编号生成器退化：decision_id=%s event_id=%s",
+                decision_id,
+                event.event_id,
+            )
+            raise BusinessError(
+                "决策编号生成冲突，请重试；若持续出现请检查编号生成器",
+                code=ErrorCode.SYSTEM_ERROR,
+                detail={"decision_id": decision_id, "event_id": event.event_id},
+            ) from exc
         raise ConflictError(
             "事件编号已存在（并发重复投递），请使用新的 event_id",
             code=ErrorCode.EVENT_DUPLICATED,

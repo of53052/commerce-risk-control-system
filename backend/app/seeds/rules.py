@@ -206,13 +206,18 @@ RULE_SEEDS: tuple[RuleSeed, ...] = (
     ),
     RuleSeed(
         code="RC_AS_002",
-        name="退款率异常偏高",
+        name="24 小时内连续退款",
         scene="after_sale",
         category=CATEGORY_AFTERSALE,
-        text="user_refund_rate_24h >= 0.5 and user_order_cnt_24h >= 4",
+        text="user_refund_cnt_24h >= 3",
         score=30,
         priority=12,
-        description="24 小时内退款率过半且订单数不低于 4，排除「只有一单」的噪声",
+        description=(
+            "24 小时内退款申请达 3 笔，即 PRD §14.3 的主命中路径。"
+            "退款率（user_refund_rate_24h）不再单独计分：它与「连续退款」高度相关，"
+            "两条规则同时命中会把同一事实重复计分，抬高整体分数到 Reject 区间；"
+            "退款率作为模型特征保留，由模型学习它与其他信号的组合权重"
+        ),
     ),
     RuleSeed(
         code="RC_AS_003",
@@ -230,9 +235,15 @@ RULE_SEEDS: tuple[RuleSeed, ...] = (
         scene="after_sale",
         category=CATEGORY_AFTERSALE,
         text="address_refund_cnt_7d >= 3",
-        score=25,
+        score=15,
         priority=18,
-        description="同一收货地址 7 天内多次退款，指向同一收货点的团伙欺诈",
+        description=(
+            "同一收货地址 7 天内多次退款，指向同一收货点的团伙欺诈。"
+            "定位是**辅助**信号（15 分，与 RC_LIST_002 / RC_ENV_003 同档）："
+            "地址聚集能指向团伙，但单独不足以定级 —— 合租房、写字楼前台等"
+            "合法共用地址并不罕见。它必须与金额、频次叠加才把分数推进人工审核区间"
+            "（address + amount + 24h 连续退款 = 75，正好落在 PRD §14.3 的 60~79）"
+        ),
     ),
 
     # ---- 名单与聚集 ----
