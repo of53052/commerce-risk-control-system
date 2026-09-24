@@ -26,6 +26,10 @@ os.environ["APP_ENV"] = "test"
 os.environ["DB_NAME"] = "risk_control_test"
 os.environ["REDIS_DB"] = "1"
 os.environ["LOG_LEVEL"] = "WARNING"
+# JWT 密钥固定为 64 字节：测试不应该依赖开发机 .env 里的密钥，
+# 而且 HS256 要求密钥 ≥ 32 字节（见 core/security.py 的说明）——
+# 若沿用短密钥，签发令牌会在测试里直接抛错。
+os.environ["JWT_SECRET"] = "test-only-secret-0123456789abcdef0123456789abcdef0123456789"
 
 import pytest  # noqa: E402
 from sqlalchemy.orm import Session, sessionmaker  # noqa: E402
@@ -97,4 +101,3 @@ def real_db(engine) -> Session:
     finally:
         session.rollback()
         session.close()
-

@@ -39,6 +39,12 @@ from app.models.rclist import (
     RcListEntry,
 )
 from app.services.config_service import get_str
+from app.services.flags import (
+    BLACKLIST_FLAG_KEY,
+    FLAG_FEATURE_KEYS,
+    GRAY_FLAG_KEYS,
+    WHITELIST_FLAG_KEY,
+)
 
 logger = logging.getLogger("app.services.list_service")
 
@@ -55,29 +61,8 @@ DIMENSION_FIELD: dict[str, str] = {
 EMPTY_SENTINEL = "__empty__"
 
 # 名单类型 -> 加成特征的键名（灰名单专用）
-GRAY_FLAG_KEYS: dict[str, str] = {
-    "user": "subject_gray_flag",
-    "phone": "phone_gray_flag",
-    "ip": "ip_gray_flag",
-    "device": "device_gray_flag",
-    "address": "address_gray_flag",
-}
-
-# 名单服务会产出的全部特征键。
-# 用途：
-#   1. 规则字段白名单 —— 规则可以引用名单标记（如 subject_gray_flag == 1），
-#      这些键不在特征注册表里（它们不是窗口聚合，而是名单匹配结果）；
-#   2. 默认值填充 —— 未命中时给 0/False，让规则总能拿到确定值，
-#      而不是"键不存在 → 条件判 false + missing_fields 告警"。
-BLACKLIST_FLAG_KEY = "subject_blacklist"
-WHITELIST_FLAG_KEY = "subject_whitelist"
-
-FLAG_FEATURE_KEYS: tuple[str, ...] = (
-    BLACKLIST_FLAG_KEY,
-    WHITELIST_FLAG_KEY,
-    *GRAY_FLAG_KEYS.values(),
-)
-
+# GRAY_FLAG_KEYS / FLAG_FEATURE_KEYS / 黑白名单键名统一由 app.services.flags 提供
+# （原因见该模块文档：把双方共用的常量下沉，解开 feature_engine 与 list_service 的循环依赖）。
 
 @dataclass(frozen=True)
 class ListHit:

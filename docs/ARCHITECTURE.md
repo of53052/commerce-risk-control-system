@@ -404,7 +404,7 @@ flowchart LR
 
 | 用途 | 键模式 | 结构 | TTL | 说明 |
 | --- | --- | --- | --- | --- |
-| 特征窗口（事件条带） | `rc:evt:{entity}:{id}:{eventType}:{window}` | ZSET | 窗口 + 10min | member = `{ts_ms}|{event_id}|{amount}`，score = `ts_ms` |
+| 特征窗口（事件条带） | `rc:evt:{entity}:{id}:{eventType}:{window}` | ZSET | 窗口 + 10min | member = `{ts_ms}|{event_id}|{amount}|{subject}`，score = `ts_ms`（`subject` 见下） |
 | 幂等结果 | `rc:idem:{event_id}` | STRING(JSON) | 24h | 命中即返回首判 |
 | 名单缓存 | `rc:list:{dimension}:{listType}` | SET | 60s | 写名单后主动 DEL |
 | 实时计数 | `rc:cnt:{metric}:{bucket}` | STRING(INCR) | 2h | bucket = `yyyyMMddHHmm` |
@@ -413,6 +413,8 @@ flowchart LR
 | 模型热切换信号 | `rc:model:active` | STRING(version) | 无 | 切换后各实例比对刷新 |
 
 **为什么用 ZSET + 编码 member 而不拆成"计数器 + 求和器"**：一个结构同时支持按时间范围 `ZCOUNT`（计数）与 `ZRANGEBYSCORE` 后解析金额求和（金额），且因为 `member` 含 `event_id`，重复投递天然不重复计数（集合语义带来免费去重）。代价是金额求和需拉取窗口内成员，实测 24h 窗口内单实体事件量为百级，成本可接受。
+
+**`subject` 段（P0 落地补入，详见 §19.5）**：第四个字段承载"这条事件属于哪个主体"（如 `user:U1`），供聚簇特征（同设备/同 IP 关联账号数）去重；不需要去重的维度写空串。**它必须独立成段、不能覆盖 `event_id` 位**——同一个键同时服务"数事件条数"与"数不同主体"两类特征，覆盖会让前者把同一主体的多次事件折叠成一个成员，计数静默减半。
 
 **内存估算**：5 万事件 × 平均 9 个键条目 ≈ 45 万 ZSET 成员，按每成员约 80B（含 Redis 开销）估算 ≈ 36MB，叠加 TTL 自动淘汰，量级安全。
 
@@ -1043,5 +1045,19 @@ flowchart TB
 
 | 状态 | 内容 |
 | --- | --- |
-| ✅ 已完成 | 依赖安装与 `.venv`；建库/迁移/种子三段式初始化；18 张 P0 表 + 审计只增触发器；3 账号 / 8 配置 / API Key 种子；`/healthz`（MySQL 8.2 + Redis 8.8 均 ok）；`alembic check` 无漂移 |
-| ○ 未完成 | 表达式引擎、服务层（特征/规则/模型/融合）、事件网关 API、模拟业务端、数据集与训练脚本、测试与 `verify_p0.ps1`、`docs/P0-验收清单.md` |
+| ✅ 已完成 | 依赖安装与 `.venv`；建库/迁移/种子三段式初始化；18 张 P0 表 + 审计只增触发器；3 账号 / 8 配置 / 20 规则 / API Key 种子；`/healthz`（MySQL 8.2 + Redis 8.8 均 ok）；`alembic check` 无漂移；表达式引擎（61 项测试）；服务层（名单/特征/规则/模型/融合/审计）；事件网关 + `POST /api/v1/events`、`/events/batch`（X-API-Key）；`POST /api/v1/auth/login`、`GET /api/v1/auth/me`（JWT）；169 项 pytest 全绿 |
+| ○ 未完成 | 模拟业务端（`app/simulator/`）、数据集与训练脚本（`gen_dataset.py` / `train_model.py`）、`rebuild_windows.py` / `replay_write_failures.py` / `dev.ps1` / `verify_p0.ps1`、`docs/P0-验收清单.md` |
+
+### 19.5 事件网关的落地偏差（P0）
+
+| 项 | 设计稿 | P0 实装 | 原因与代价 |
+| --- | --- | --- | --- |
+| 落库时机 | §5.1：同步段只碰内存与 Redis，MySQL 写入走写回队列（失败重试 3 次 + `write_failure.log` + 重放脚本） | **同步事务提交**，成功后才写条带与幂等缓存 | 单进程演示系统，本地写 5 张表约 5~15ms，仍在 §12 的 P95 预算内；而写回队列会引入"响应成功但库里没有"的窗口，且踩坑记录表明 MySQL 元数据锁问题在异步路径上极难定位。**代价**：事件接入与 MySQL 可用性耦合（MySQL 挂 → 接入失败而非"先收后补"）。`replay_write_failures.py` 因此推迟到引入队列时再实装。 |
+| 条带 member 格式 | §6.2：`{ts_ms}\|{event_id}\|{amount}`（3 段），聚簇特征靠 `{prefix}:{subject}` 覆盖 `event_id` 位 | **4 段**：`{ts_ms}\|{event_id}\|{amount}\|{subject}` | 3 段方案下同一个键（如 `rc:evt:device:D1:coupon_receive:1h`）要同时服务"计数"与"主体去重"，覆盖式写法会让**计数翻倍**（`device_coupon_cnt_1h` 把 3 次算成 6 次，规则阈值静默减半）。4 段方案一个事件一个成员，计数与去重各取所需，且向后兼容 3 段旧成员。 |
+| 特征快照的内容 | §7.3：快照是"扁平键值" | **只含注册表声明过的键**；响应把"参与打分的特征"与"仅供核对的事实"拆成 `features` / `context` 两个字段 | 把 payload、设备指纹等原始事实混进快照，会让模型向量与训练列集合随事件类型漂移，且审核员无法区分"这个键影响了决策"与"这个键只是被展示"。`feature_engine.split_context()` 负责拆分，出现未注册键时记 WARNING。 |
+| 计数类特征是否含当前事件 | §7.1 未明确 | 当前事件在其**涉及的每个维度**上的 `*_cnt` 都 **+1**（`_compute_current_event_counts`） | 条带写入发生在决策之后，不补偿则每条链路**第一条事件**的频次恒为 0，且"设备/地址维度永远少 1 次"是永久性的 —— `device_coupon_cnt_1h > 5` 这类规则会一直差一次才命中，全程无报错。金额求和（`_compute_sum`）与主体去重本就已补偿，此处是补齐一致性。 |
+| 跨事件类型的主体去重 | §7.3 未明确 | 由 `window_store.distinct_subjects` 一次取多类型条带后**合并去重** | 同一账号可能同时有登录与领券事件；逐类型相加会把它数两次（"同设备 3 个账号"变成 6 个），属于同一类"无报错的阈值失效"。 |
+| 名单标记的特征声明 | §7.2 未单列 | 键名下沉到 `app/services/flags.py`，声明由 `list_service.LIST_FLAG_SPECS` 提供 | `feature_engine` 与 `list_service` 互相需要对方的定义（前者要键名、后者要 `FeatureSpec`），把共用常量下沉到叶子模块是解开循环依赖的最小改动。 |
+| `JWT_SECRET` 长度 | §10 未规定 | 签发前校验 HS256 密钥 ≥ 32 字节，不足直接抛错 | PyJWT 对短密钥每次都打 `InsecureKeyLengthWarning`，告警刷屏会掩盖真正需要关注的安全提示；把"配置不合格"提前到签发期比运行期告警更有用。 |
+| 案件编号 | §9.1：中高风险自动建案 | P0 **不建案**，`case_no` 留空并在 `notes` 说明 | `rc_case` 属 P1（案件流转与工作台同期交付）。留空 + 显式说明优于"写一个查不到的案件号"。 |
+| 未知特征字段 | §7.2 要求"规则引用未知字段应在保存时拦住" | 求值期宽容（判 false）并计入响应的 `missing_fields` + WARNING 日志；硬拦截留给 P2 的规则保存接口（`known_feature_keys()` 已就绪） | P0 没有规则编辑入口，唯一的写入方是种子数据（已由 `validate_node` 校验）。为"没有写入口的路径"提前建表存疑键，收益低于维护成本。 |

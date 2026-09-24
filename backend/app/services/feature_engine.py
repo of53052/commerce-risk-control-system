@@ -30,7 +30,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.timeutil import to_ms, utcnow
@@ -44,7 +44,7 @@ from app.models.event import (
 )
 from app.services import window_store
 from app.services.config_service import get_value
-from app.services.list_service import FLAG_FEATURE_KEYS
+from app.services.flags import BLACKLIST_FLAG_KEY, FLAG_FEATURE_KEYS, GRAY_FLAG_KEYS, WHITELIST_FLAG_KEY
 
 logger = logging.getLogger("app.services.feature_engine")
 
@@ -81,6 +81,21 @@ class FeatureSpec:
 # --------------------------------------------------------------------------- #
 # 特征注册表（docs/PRD.md 7.2 的 27 个特征键）
 # --------------------------------------------------------------------------- #
+# 名单标记的特征声明：键名由 app/services/flags.py 提供（名单服务的产出物），
+# 但**声明必须与注册表同源** —— `is_feature_key` 与 `known_feature_keys`
+# 都以本注册表为准，若这些键靠"别人导入时回填"，任何一条不经过
+# app.models 的调用路径（脚本、单测、将来的 worker）都会把
+# subject_blacklist 误判成"上下文"，于是特征快照里少了它、模型也读不到，
+# 而这一切不会报错。宁可多写这几行，也不要引入导入序依赖。
+LIST_FLAG_SPECS: tuple[FeatureSpec, ...] = (
+    FeatureSpec(BLACKLIST_FLAG_KEY, "flag", description="主体是否命中黑名单（名单服务产出，直接决定动作）"),
+    FeatureSpec(WHITELIST_FLAG_KEY, "flag", description="主体是否命中白名单（名单服务产出，直接决定动作）"),
+    *(
+        FeatureSpec(key, "flag", description=f"名单维度 {dimension} 是否命中灰名单（加成特征）")
+        for dimension, key in GRAY_FLAG_KEYS.items()
+    ),
+)
+
 FEATURE_REGISTRY: tuple[FeatureSpec, ...] = (
     # ---- 用户行为频次 ----
     FeatureSpec("user_login_cnt", "count", entity="user", event_types=(EVENT_LOGIN,), windows=("1h", "24h", "7d")),
@@ -145,12 +160,69 @@ FEATURE_REGISTRY: tuple[FeatureSpec, ...] = (
     # ---- 主体画像 ----
     FeatureSpec("account_age_days", "profile", description="账号注册天数"),
     FeatureSpec("subject_case_cnt", "profile", description="近 30 天该主体风险案件数（P1 案件表就绪后接入）"),
-    FeatureSpec("subject_blacklist", "flag", description="主体是否命中名单库"),
     FeatureSpec("night_activity_ratio", "profile", description="夜间（0-6 点）行为占比（P0 为当前事件二值化口径）"),
     FeatureSpec("device_new_account_cnt", "profile", description="同设备新账号数（device_new_account_ratio 的分子）"),
+
+    # ---- 名单标记（键名见 app/services/flags.py）----
+    *LIST_FLAG_SPECS,
 )
 
 FEATURE_SPECS_BY_KEY: dict[str, FeatureSpec] = {spec.key: spec for spec in FEATURE_REGISTRY}
+
+# ---- 上下文键 vs 特征键 ---------------------------------------------------- #
+# 特征引擎的产出分两类，**必须分开**：
+#   1. 特征（feature）：注册表里声明过的键，落 rc_feature_snapshot.features，
+#      并进入模型特征向量；
+#   2. 上下文（context）：求值器为支撑规则而额外附带的**原始事实**
+#      （如 device_fingerprint / payload），规则可以引用它们
+#      （如 payload.order_no != null），但它们不是模型输入。
+# 分开的核心理由：模型离线训练用的特征列就是「注册表展开的键」，
+# 若把上下文混进快照与向量，训练与推理的列集合会随事件类型漂移，
+# 从而让「同一模型对不同事件类型考不同的卷」。
+# 注：名单标记（subject_blacklist / subject_gray_flag 等）虽不在注册表里，
+# 但它们是**正式特征**，其 FeatureSpec 声明在 list_service.FLAG_FEATURE_KEYS，
+# 由 app/models/__init__.py 在导入期注册（避免模块循环导入）。
+NON_FEATURE_CONTEXT_KEYS: frozenset[str] = frozenset(FEATURE_SPECS_BY_KEY)
+
+
+def is_feature_key(key: str) -> bool:
+    """判定一个键是「特征」还是「上下文」。
+
+    必须同时认「基名」（``user_coupon_cnt``）与「展开名」（``user_coupon_cnt_24h``）：
+    注册表里存的是基名 + 窗口清单，展开发生在计算时。若只判断基名，
+    所有带窗口的特征都会被误判成上下文 —— 后果是**特征快照几乎为空、
+    上下文里塞满特征**，界面与模型都会读到错的东西，而且不报任何错。
+
+    窗口后缀必须来自该声明自己声明的 ``windows``，不能用一个全局后缀集合：
+    策略师在 sys_config 里新增「30d」档位时，全局集合不会自动包含它，
+    于是 ``xxx_30d`` 会被静默归入上下文。
+
+    注意这里不做缓存：名单标记（flag）在 app.models 导入期才回填进注册表，
+    任何"导入时算好的集合"都会漏掉它们。逐键线性扫描 35 条声明的开销在微秒级，
+    相对一次决策的网络往返可以忽略。
+    """
+    if key in FEATURE_SPECS_BY_KEY:
+        return True
+    for spec in FEATURE_REGISTRY:
+        if not spec.windows:
+            continue
+        prefix = f"{spec.key}_"
+        if key.startswith(prefix) and key[len(prefix):] in spec.windows:
+            return True
+    return False
+
+
+def split_context(features: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """把扁平字典拆成 (特征快照, 未声明的上下文)。
+
+    返回顺序刻意是「快照在前」：调用点最常见的写法是
+    ``snapshot, context = split_context(features)``。
+    """
+    snapshot: dict[str, Any] = {}
+    context: dict[str, Any] = {}
+    for key, value in features.items():
+        (snapshot if is_feature_key(key) else context)[key] = value
+    return snapshot, context
 
 
 def registry_keys(windows: dict[str, int] | None = None) -> list[str]:
@@ -167,6 +239,20 @@ def registry_keys(windows: dict[str, int] | None = None) -> list[str]:
     return sorted(set(keys))
 
 
+def distinct_subject_entities() -> dict[str, str]:
+    """聚簇实体 -> 主体前缀（如 ``{"device": "user"}``）。
+
+    由注册表推导而不是各处硬编码：写入侧（event_gateway）与读取侧
+    （``_compute_distinct_features``）都依赖这份映射，
+    分头维护必然漂移 —— 而漂移的表现是"聚集度特征恒为 0"，不报错。
+    """
+    return {
+        spec.entity: spec.subject_prefix
+        for spec in FEATURE_REGISTRY
+        if spec.agg == "distinct" and spec.entity and spec.subject_prefix
+    }
+
+
 def _active_windows(db: Session | None) -> dict[str, int]:
     """当前生效的窗口档位：优先读 sys_config，读不到用默认档位。"""
     if db is None:
@@ -181,6 +267,16 @@ def _active_windows(db: Session | None) -> dict[str, int]:
         except (TypeError, ValueError):
             return dict(DEFAULT_WINDOWS)
     return dict(DEFAULT_WINDOWS)
+
+
+def active_windows(db: Session | None) -> dict[str, int]:
+    """对外暴露的窗口档位读取入口。
+
+    网关与脚本需要知道「这次决策用的是哪档窗口」才能把 window_profile 写对。
+    下划线版本是内部实现细节，跨模块直接用会形成隐性耦合，
+    因此提供这个公开别名而不是让调用方去访问私有函数。
+    """
+    return _active_windows(db)
 
 
 def known_feature_keys(db: Session | None = None) -> set[str]:
@@ -260,6 +356,12 @@ def compute(
             _compute_sum(result, spec, entities, windows, ts_ms, payload)
 
     _compute_distinct_features(result, entities, windows, ts_ms, subject_of_entity)
+    _compute_current_event_counts(
+        result,
+        entities=entities,
+        event_type=event_type,
+        windows=windows,
+    )
     _compute_business_features(
         result,
         db,
@@ -343,7 +445,52 @@ def _compute_sum(result: FeatureResult, spec: FeatureSpec, entities, windows, ts
         result.features[key] = round(total, 2)
 
 
+def _compute_current_event_counts(
+    result: FeatureResult,
+    *,
+    entities: dict[str, str | None],
+    event_type: str,
+    windows: dict[str, int],
+) -> None:
+    """把「当前这条事件」计入**它自己涉及的每一个维度**的频次特征。
+
+    条带写入发生在决策**之后**（见 event_gateway 的模块文档），
+    所以特征计算时当前事件在任何维度上都还不在 ZSET 里。不补偿的后果是
+    每条链路的**第一次动作**频次恒为 0："1 小时内领券 1 次"算成 0，
+    而"首单/首次领券"恰恰是最该被风控关注的行为 —— 且全程不报任何错。
+
+    补偿范围必须覆盖**全部维度**（user / device / ip / address / phone），
+    不能只补 user 维度：device 上的计数说的是"这台设备上发生过几次领券"，
+    本次事件同样是那次动作，漏补会让设备维度的频次永远比真实值少 1，
+    于是 ``device_coupon_cnt_1h > 5`` 这类规则永远差一次才命中。
+
+    两个条件缺一不可：
+      1. ``spec.agg == "count"``：求和类由 ``_compute_sum`` 自行加上 payload 金额
+         （同样的理由，同样的必要性）；ratio 派生自计数，会自动跟着对；
+      2. 当前事件类型在该声明的 ``event_types`` 里，且该维度取值存在 ——
+         维度缺失时特征已记 0 并进 missing_fields，不该再补成 1。
+    """
+    for spec in FEATURE_REGISTRY:
+        if spec.agg != "count" or event_type not in spec.event_types:
+            continue
+        if not entities.get(spec.entity or ""):
+            continue
+        for key in spec.keys(windows):
+            current = result.features.get(key)
+            if isinstance(current, (int, float)):
+                result.features[key] = current + 1
+
+
 def _compute_distinct_features(result: FeatureResult, entities, windows, ts_ms: int, subject_of_entity) -> None:
+    """聚簇特征：主体去重。
+
+    **跨事件类型的去重必须由本函数合并，不能各键各算**：
+    ``device_account_cnt_24h`` 覆盖 login / coupon_receive / order_create / order_pay
+    四类事件，同一个账号可能既有登录又有领券。若把每类事件的去重结果相加，
+    这个账号会被数两次（"同设备关联 3 个账号"变成"6 个"），阈值静默失效。
+    因此这里把所有事件类型的成员**一次取出后合并去重**，
+    再补上"当前事件的主体"（事件尚未入条带）。
+    """
     for spec in FEATURE_REGISTRY:
         if spec.agg != "distinct":
             continue
@@ -356,28 +503,20 @@ def _compute_distinct_features(result: FeatureResult, entities, windows, ts_ms: 
                 result.features[key] = 0
                 _mark_missing(result, key)
                 continue
-            subjects: set[str] = set()
-            for event_type in spec.event_types:
-                members = window_store.safe_call(
-                    [],
-                    window_store.range_members,
-                    entity=spec.entity,
-                    entity_id=entity_id,
-                    event_type=event_type,
-                    window=window,
-                    window_seconds=windows[window],
-                    now_ms=ts_ms,
-                )
-                for member in members:
-                    # 写入聚簇事件时，条带 member 的 event_id 位被写成
-                    # "{prefix}:{subject}"（见 window_store.pack_member 与
-                    # 写入方 event_gateway），这里 split 一次还原主体。
-                    parts = member.event_id.split(":", 1)
-                    if len(parts) == 2 and parts[0] == spec.subject_prefix:
-                        subjects.add(parts[1])
+            subjects = window_store.safe_call(
+                set(),
+                window_store.distinct_subjects,
+                entity=spec.entity,
+                entity_id=entity_id,
+                event_types=list(spec.event_types),
+                window=window,
+                window_seconds=windows[window],
+                now_ms=ts_ms,
+                prefix=spec.subject_prefix,
+            )
             current_subject = subject_of_entity.get(spec.entity or "")
             if current_subject and current_subject.startswith(f"{spec.subject_prefix}:"):
-                subjects.add(current_subject.split(":", 1)[1])
+                subjects = set(subjects) | {current_subject.split(":", 1)[1]}
             result.features[key] = len(subjects)
 
 

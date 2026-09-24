@@ -2,10 +2,14 @@
 
 条带结构（docs/ARCHITECTURE.md §6.2）::
 
-    KEY    rc:evt:{entity}:{entity_id}:{event_type}:{window}
-    MEMBER {ts_ms}|{event_id}|{amount}
-    SCORE  ts_ms
-    TTL    窗口秒数 + 10 分钟
+KEY    rc:evt:{entity}:{entity_id}:{event_type}:{window}
+ MEMBER {ts_ms}|{event_id}|{amount}|{subject}
+ SCORE  ts_ms
+ TTL    窗口秒数 + 10 分钟
+
+``subject`` 段承载"这条事件属于哪个主体"（如 ``user:U1``，为空表示该维度不需要去重），
+用于聚簇特征（同设备/同 IP 关联账号数）的去重；计数与金额仍分别取自
+member 的**条数与第三段**，两者互不干扰。详见 pack_member 的说明。
 
 为什么不拆成"计数器 + 金额累加器"两个键：
     1. member 里带 ``event_id``，同一事件重复写入 ZSET 是幂等的（集合语义免费去重），
@@ -48,23 +52,40 @@ class StripMember:
     ts_ms: int
     event_id: str
     amount: float
+    subject: str = ""
 
 
-def pack_member(ts_ms: int, event_id: str, amount: float | None = None) -> str:
+def pack_member(
+    ts_ms: int,
+    event_id: str,
+    amount: float | None = None,
+    subject: str | None = None,
+) -> str:
     """打包成员字符串。
 
-    ``amount`` 缺省写 0：保持字段数固定（永远三段），
-    解析侧就不必写"两段/三段"两套分支。分隔符用 ``|``，
+    ``amount`` 缺省写 0、``subject`` 缺省写空串：**字段数恒为四段**，
+    解析侧就不必写"三段/四段"两套分支。分隔符用 ``|``，
     而业务号里不含 ``|``（订单号/事件号都由字母数字下划线短横组成）。
-    """
-    return f"{ts_ms}|{event_id}|{amount if amount is not None else 0}"
 
+    **``subject`` 为什么单独占一段（而不是覆盖 event_id 位）**：
+    同一个键（如 ``rc:evt:device:D1:coupon_receive:1h``）同时服务两类特征 ——
+    ``device_coupon_cnt_1h``（数事件条数）与 ``device_account_cnt_1h``（数不同主体）。
+    若按"聚簇特征就把 event_id 写成 ``user:{id}``"的写法，同一用户的两条事件
+    会折叠成**同一个 member**，ZSET 去重后条数直接减半到正确值的一半（3 次算成 1 次），
+    规则阈值会静默失效。四段格式里 event_id 保持真实值（去重与计数都正确），
+    主体标识独立成段供去重使用。
+    """
+    return f"{ts_ms}|{event_id}|{amount if amount is not None else 0}|{subject or ''}"
 
 def unpack_member(member: str) -> StripMember:
-    """解析成员字符串；格式异常时返回 amount=0 而不抛错。
+    """解析成员字符串；格式异常时逐字段降级而不抛错。
 
     容错理由：条带是"观测数据"，一条脏成员不应该让整次特征计算失败；
-    计数仍然有效，只有金额这一项退化为 0。
+    计数仍然有效，只有金额/主体这两项退化为空值。
+
+    兼容三段旧成员（``ts|event_id|amount``）：Redis 里可能残留上一版格式写的成员，
+    它们没有 subject，聚簇特征会少算这部分历史，但计数与金额仍可读 ——
+    比"读不出来直接报错"更符合"Redis 是可丢缓存"的定位。
     """
     parts = member.split("|")
     ts_ms = int(parts[0]) if parts and parts[0].isdigit() else 0
@@ -75,7 +96,8 @@ def unpack_member(member: str) -> StripMember:
             amount = float(parts[2])
         except ValueError:
             amount = 0.0
-    return StripMember(ts_ms=ts_ms, event_id=event_id, amount=amount)
+    subject = parts[3] if len(parts) > 3 else ""
+    return StripMember(ts_ms=ts_ms, event_id=event_id, amount=amount, subject=subject)
 
 
 def add_event(
@@ -88,12 +110,13 @@ def add_event(
     ts_ms: int,
     event_id: str,
     amount: float | None = None,
+    subject: str | None = None,
     client: Redis | None = None,
 ) -> None:
     """把一个事件写入一条条带。"""
     redis = client or get_redis()
     key = evt_key(entity, entity_id, event_type, window)
-    member = pack_member(ts_ms, event_id, amount)
+    member = pack_member(ts_ms, event_id, amount, subject)
     pipe = redis.pipeline(transaction=False)
     pipe.zadd(key, {member: ts_ms})
     # 每次写都续 TTL：条带 TTL 的语义是"最后一条事件之后还留多久"，
@@ -110,6 +133,7 @@ def add_event_to_entities(
     ts_ms: int,
     event_id: str,
     amount: float | None = None,
+    entity_subjects: dict[str, str] | None = None,
     client: Redis | None = None,
 ) -> int:
     """一次把事件写入「多个实体 × 多个窗口」的全部条带。
@@ -117,9 +141,14 @@ def add_event_to_entities(
     用 pipeline 批量下发：一次决策要写 5 个实体 × 3 个窗口 = 15 个键，
     不批量化就是 15 次 RTT，在本地也能占掉几十毫秒。
     返回实际下发的命令数（便于测试断言与排障）。
+
+    ``entity_subjects`` 是「实体 -> 主体标识」映射（如
+    ``{"device": "user:U1", "ip": "user:U1"}``），只对需要做主体去重的
+    聚簇实体提供（见 feature_engine.distinct_subject_entities）；
+    其余实体写空主体，成员格式保持统一。
     """
     redis = client or get_redis()
-    member = pack_member(ts_ms, event_id, amount)
+    subjects = entity_subjects or {}
     pipe = redis.pipeline(transaction=False)
     commands = 0
 
@@ -128,6 +157,7 @@ def add_event_to_entities(
             # 实体字段为空（如事件无收货地址）：不建键。
             # 该组特征在读取时会因为键不存在而返回 0，并记入 missing_fields。
             continue
+        member = pack_member(ts_ms, event_id, amount, subjects.get(entity))
         for window, seconds in windows.items():
             key = evt_key(entity, entity_id, event_type, window)
             pipe.zadd(key, {member: ts_ms})
@@ -212,29 +242,74 @@ def distinct_count(
     prefix: str,
     client: Redis | None = None,
 ) -> int:
-    """窗口内「去重后的不同主体数」。
+    """单个事件类型的窗口内「去重后的不同主体数」。"""
+    return len(
+        distinct_subjects(
+            entity=entity,
+            entity_id=entity_id,
+            event_types=[event_type],
+            window=window,
+            window_seconds=window_seconds,
+            now_ms=now_ms,
+            prefix=prefix,
+            client=client,
+        )
+    )
 
-    实现方式：把条带成员拉出来，从 member 的第三段读不到区分信息，
-    因此聚簇类特征（同设备关联账号数、同 IP 关联账号数）**单靠事件条带做不到**。
-    这里改为约定：这类特征使用**带主体前缀的条带** —— 写入时把
-    ``event_id`` 位写成 ``{prefix}:{subject_id}``（见 feature_engine 的聚簇特征），
-    读取时按前缀去重。这样仍是一个 ZSET 搞定，不需要额外的 SET 结构。
+
+def distinct_subjects(
+    *,
+    entity: str,
+    entity_id: str,
+    event_types: list[str],
+    window: str,
+    window_seconds: int,
+    now_ms: int,
+    prefix: str,
+    client: Redis | None = None,
+) -> set[str]:
+    """多个事件类型**合并后**的窗口内主体集合。
+
+    **为什么必须一次算完而不是逐类型相加**：一个账号可能同时有登录与领券两类事件，
+    逐类型相加会把这个账号数两次（"同设备 3 个账号"变成 6 个），
+    而阈值不会因此报错，只会静默失效。
+
+    实现方式：读取成员第四段的 ``subject``（格式 ``{prefix}:{subject_id}``），
+    按前缀过滤后去重。这样仍是一个 ZSET 搞定，不需要额外的 SET 结构，
+    也不会与"数事件条数"的计数特征互相干扰 —— 这正是把主体独立成段的原因
+    （见 pack_member 的说明）。
     """
     members = range_members(
         entity=entity,
         entity_id=entity_id,
-        event_type=event_type,
+        event_type=event_types[0],
         window=window,
         window_seconds=window_seconds,
         now_ms=now_ms,
         client=client,
     )
-    subjects = {
-        member.event_id.split(":", 1)[1]
-        for member in members
-        if member.event_id.startswith(f"{prefix}:")
-    }
-    return len(subjects)
+    subjects: set[str] = set()
+
+    def _collect(items: list[StripMember]) -> None:
+        for member in items:
+            head, _, subject_id = member.subject.partition(":")
+            if head == prefix and subject_id:
+                subjects.add(subject_id)
+
+    _collect(members)
+    for event_type in event_types[1:]:
+        _collect(
+            range_members(
+                entity=entity,
+                entity_id=entity_id,
+                event_type=event_type,
+                window=window,
+                window_seconds=window_seconds,
+                now_ms=now_ms,
+                client=client,
+            )
+        )
+    return subjects
 
 
 def safe_call(default, func, *args, **kwargs):
@@ -248,4 +323,3 @@ def safe_call(default, func, *args, **kwargs):
         return func(*args, **kwargs)
     except RedisError:
         return default
-

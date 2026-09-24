@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import itertools
 from datetime import timedelta
 
 import pytest
@@ -30,13 +31,16 @@ pytestmark = pytest.mark.integration
 
 WINDOWS = {"1h": 3600, "24h": 86400, "7d": 604800}
 
+# 自动事件编号：见 _seed_event 的 event_id 参数说明。
+_auto_event_seq = itertools.count(1)
+
 
 def _seed_event(
     *,
     user_id: str,
     event_type: str,
     occurred_at,
-    event_id: str,
+    event_id: str | None = None,
     amount: float | None = None,
     device_id: str | None = None,
     ip: str | None = None,
@@ -45,9 +49,17 @@ def _seed_event(
 ) -> None:
     """把一个事件写进条带（模拟 event_gateway 的写入动作）。
 
-    聚簇实体（设备/IP）的 member 需要写成 ``user:{user_id}``，
-    与 feature_engine 的去重读取约定一致。
+    聚簇实体（设备/IP）的成员第四段写 ``user:{user_id}`` 承载主体标识，
+    与 feature_engine 的去重读取约定一致；事件号保持真实值，
+    否则"数事件条数"的计数特征会把多个事件折叠成一个成员。
+
+    ``event_id`` 表示"这就是那条已经被写入条带的真实事件"（网关的写入发生在
+    决策之后，因此被测的当次决策对应的事件**不会**出现在条带里）。
+    留空的默认值取测试内自增编号：同一主体在同一个测试里写多条事件时，
+    成员必须互不相同，编号不参与断言。
     """
+    if event_id is None:
+        event_id = f"AUTO{next(_auto_event_seq)}"
     ts_ms = to_ms(occurred_at)
     entities = [(ENTITY_USER, user_id)]
     if device_id:
@@ -55,6 +67,9 @@ def _seed_event(
     if ip:
         entities.append((ENTITY_IP, ip))
 
+    entity_subjects = {
+        entity: f"user:{user_id}" for entity in (ENTITY_DEVICE, ENTITY_IP) if entity
+    }
     window_store.add_event_to_entities(
         entities=entities,
         event_type=event_type,
@@ -62,35 +77,24 @@ def _seed_event(
         ts_ms=ts_ms,
         event_id=event_id,
         amount=amount,
+        entity_subjects=entity_subjects,
         client=redis_client,
     )
-    # 聚簇条带单独写：member 用 user:{user_id} 承载主体标识
-    for entity, entity_id in ((ENTITY_DEVICE, device_id), (ENTITY_IP, ip)):
-        if not entity_id:
-            continue
-        for window, seconds in windows.items():
-            window_store.add_event(
-                entity=entity,
-                entity_id=entity_id,
-                event_type=event_type,
-                window=window,
-                window_seconds=seconds,
-                ts_ms=ts_ms,
-                event_id=f"user:{user_id}",
-                amount=amount,
-                client=redis_client,
-            )
 
 
 def test_user_coupon_cnt_across_windows(db, redis_client) -> None:
-    """1h / 24h / 7d 三档窗口应各算到落在窗口内的条数。"""
+    """1h / 24h / 7d 三档窗口应各算到落在窗口内的条数。
+
+    期望值含**当次决策的事件自身**（+1）：条带写入发生在决策之后，
+    因此"1 小时内领券 1 次"对第一条领券事件必须算成 1 而不是 0
+    （见 feature_engine._compute_current_event_counts）。
+    """
     now = utcnow()
-    for index, delta in enumerate([timedelta(minutes=10), timedelta(hours=3), timedelta(days=3)]):
+    for _, delta in enumerate([timedelta(minutes=10), timedelta(hours=3), timedelta(days=3)]):
         _seed_event(
             user_id="U1",
             event_type=EVENT_COUPON_RECEIVE,
             occurred_at=now - delta,
-            event_id=f"E{index}",
             amount=20,
             redis_client=redis_client,
         )
@@ -103,9 +107,9 @@ def test_user_coupon_cnt_across_windows(db, redis_client) -> None:
         occurred_at=now,
     )
 
-    assert result.get("user_coupon_cnt_1h") == 1
-    assert result.get("user_coupon_cnt_24h") == 2
-    assert result.get("user_coupon_cnt_7d") == 3
+    assert result.get("user_coupon_cnt_1h") == 2
+    assert result.get("user_coupon_cnt_24h") == 3
+    assert result.get("user_coupon_cnt_7d") == 4
 
 
 def test_sum_includes_current_event(db, redis_client) -> None:
@@ -143,8 +147,9 @@ def test_window_boundary_excludes_old_events(db, redis_client) -> None:
     result = feature_engine.compute(
         db, event_type=EVENT_COUPON_RECEIVE, user_id="U3", occurred_at=now
     )
-    assert result.get("user_coupon_cnt_1h") == 0
-    assert result.get("user_coupon_cnt_24h") == 1
+    # 1h 窗口只含当前事件自身（历史那条在 2 小时前）；24h 窗口含历史 1 条 + 当前 1 条
+    assert result.get("user_coupon_cnt_1h") == 1
+    assert result.get("user_coupon_cnt_24h") == 2
 
 
 def test_replay_is_deterministic(db, redis_client) -> None:
@@ -160,7 +165,8 @@ def test_replay_is_deterministic(db, redis_client) -> None:
     )
     first = feature_engine.compute(db, event_type=EVENT_ORDER_CREATE, user_id="U4", occurred_at=now)
     second = feature_engine.compute(db, event_type=EVENT_ORDER_CREATE, user_id="U4", occurred_at=now)
-    assert first.features["user_order_cnt_24h"] == second.features["user_order_cnt_24h"] == 1
+    # 历史 1 条 + 当前事件自身 1 条
+    assert first.features["user_order_cnt_24h"] == second.features["user_order_cnt_24h"] == 2
     assert first.features["user_order_amount_24h"] == second.features["user_order_amount_24h"]
 
 
@@ -228,9 +234,10 @@ def test_refund_rate_ratio(db, redis_client) -> None:
     )
 
     result = feature_engine.compute(db, event_type=EVENT_AFTER_SALE_APPLY, user_id="U10", occurred_at=now)
-    assert result.get("user_refund_cnt_24h") == 1
+    # 退款类只有当前这一条事件（历史 R0 也是同主体的退款申请）
+    assert result.get("user_refund_cnt_24h") == 2
     assert result.get("user_order_cnt_24h") == 4
-    assert result.get("user_refund_rate_24h") == pytest.approx(0.25)
+    assert result.get("user_refund_rate_24h") == pytest.approx(0.5)
 
 
 def test_refund_rate_zero_when_no_orders(db, redis_client) -> None:
@@ -327,4 +334,3 @@ def test_registry_covers_prd_feature_keys() -> None:
         "account_age_days", "subject_case_cnt", "subject_blacklist", "night_activity_ratio",
     }
     assert required <= keys, f"注册表缺少：{sorted(required - keys)}"
-

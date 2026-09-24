@@ -36,6 +36,10 @@ BCRYPT_MAX_BYTES = 72
 # API Key 明文长度：token_urlsafe(32) 约 43 个字符，约 256 bit 熵。
 API_KEY_BYTES = 32
 
+# HMAC 类算法（HS256/HS384/HS512）的密钥长度下限（字节）。
+# 取值来自 RFC 7518 §3.2：密钥长度不应小于哈希输出长度，HS256 即 32 字节。
+MIN_HMAC_SECRET_BYTES = 32
+
 
 class InvalidTokenError(Exception):
     """令牌无效或已过期。单独定义异常类型，便于接口层统一映射为 401。"""
@@ -86,7 +90,19 @@ def create_access_token(
 
     过期时间一并返回，是为了让登录接口直接把它返给前端做"提前续期"判断，
     避免前端自己解析 JWT 造成时间口径不一致（前端时区不可信）。
+
+    **HS256 的密钥长度必须 ≥ 32 字节**：更短的密钥会让 PyJWT 每次签发/校验都打
+    ``InsecureKeyLengthWarning``（RFC 7518 §3.2 的建议下限），
+    而告警刷屏会掩盖真正需要关注的安全提示。这里在签发前显式拦一次，
+    把"配置有问题"变成启动期就能发现的错误，而不是运行期的一条条告警。
     """
+    secret_bytes = settings.JWT_SECRET.encode("utf-8")
+    if settings.JWT_ALGORITHM.startswith("HS") and len(secret_bytes) < MIN_HMAC_SECRET_BYTES:
+        raise ValueError(
+            f"JWT_SECRET 过短（{len(secret_bytes)} 字节）；"
+            f"{settings.JWT_ALGORITHM} 要求至少 {MIN_HMAC_SECRET_BYTES} 字节。"
+            "请在 backend/.env 中改为随机长字符串。"
+        )
     days = expires_days if expires_days is not None else settings.JWT_EXPIRE_DAYS
     now = datetime.now(timezone.utc)
     expire = now + timedelta(days=days)
@@ -130,4 +146,3 @@ def hash_api_key(raw: str) -> str:
 def verify_api_key(raw: str, stored_hash: str) -> bool:
     """常数时间比对 API Key 摘要，避免时序侧信道。"""
     return hmac.compare_digest(hash_api_key(raw), stored_hash)
-
